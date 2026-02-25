@@ -1,7 +1,22 @@
+// Cadastro_Modelo.cs
+// ✅ 100% completo (1 arquivo) baseado no seu código
+// ✅ AGORA:
+//   - Writes no MySQL (grupometalContext) ficam COMENTADOS
+//   - TODA LEITURA (grid + detalhes + projeto + imagem + tipos) vem do PostGre (gmetalContext)
+//   - Inserts/Updates/Deletes acontecem APENAS no PostGre
+// ✅ EXTRA:
+//   - Ao salvar NOVO PROJETO ou NOVA REVISÃO -> envia e-mail para Joao.rossitti@grupometal.com.br
+//
+// ⚠️ Observações importantes:
+// 1) Eu mantive o Azure Blob para upload (como você já tinha), mas a UI passa a carregar a imagem do PostGre (bytea) por padrão.
+// 2) O popup FrmSelecionarCliente não foi fornecido aqui. Ele continua igual. Idealmente ele também deveria buscar do PostGre.
+// 3) Este arquivo assume que o gmetalContext tem os DbSets: Modelo, Projeto, ProjetoImagem, Empresa_GM, TipoModelo
+//    com campos equivalentes aos usados no seu MySQL. Se algum nome estiver diferente no seu PG, me diga o erro de compile que eu ajusto.
+
 using Azure.Storage.Blobs;
 using Controle_Pedidos;
-using Controle_Pedidos.Controle_Producao.Entities;
-using Controle_Pedidos.Entities_GM;
+using Controle_Pedidos.Controle_Producao.Entities; // (MySQL) mantido só para compatibilidade do projeto, writes comentados
+using Controle_Pedidos.Entities_GM;                 // (PostGre) agora é a fonte oficial (leitura + escrita)
 using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
@@ -21,7 +36,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _empresaIdSelecionada = null;
 
         // =========================
-        // AZURE (MESMO DO MIGRADOR)
+        // AZURE
         // =========================
         private const string _baseUrl = "https://armazenamentoazure.blob.core.windows.net/";
         private const string _containerName = "images-fa";
@@ -37,6 +52,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         // ✅ Detalhes (cancelamento + proteção durante bind)
         private CancellationTokenSource? _ctsCarregarDetalhes;
         private bool _isBindingGrid = false;
+
+        // =========================
+        // CARD: Projetos Status 'R'
+        // =========================
+        private int _qtdProjetosStatusR = 0;
 
         // =========================
         // MODO DA TELA (VIEW/ADD/EDIT)
@@ -57,6 +77,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _projetoIdAtual = null;
         private int _revProjetoAtual = 0;
 
+        // =========================
+        // CONTROLE: Projeto reprovado (Status R) que foi aberto pelo CARD
+        // =========================
+        private int? _projetoIdReprovadoAberto = null;
+
         // ===== ORIGEM IMAGEM =====
         // Novo Projeto (arquivo) continua igual
         private string? _imagemLocalPath = null;
@@ -70,6 +95,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private bool _temProjetoAtual = false;
         private int _revUltimoProjeto = 0;
 
+        // =========================
+        // EMAIL (notificação)
+        // =========================
+        private const string _emailNotificacaoDestino = "Joao.rossitti@grupometal.com.br";
+
         public Cadastro_Modelo()
         {
             InitializeComponent();
@@ -82,6 +112,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             btnNovaRevisao.Click += btnNovaRevisao_Click;
             btnSalvarProjeto.Click += btnSalvarProjeto_Click;
             btnImprimir.Click += btnImprimir_Click;
+
+            // Card Projetos R (clique no painel/labels)
+            pnlCardProjetosR.Click += pnlCardProjetosR_Click;
+            lblProjetosRTitle.Click += pnlCardProjetosR_Click;
+            lblProjetosRCount.Click += pnlCardProjetosR_Click;
 
             // revisão bloqueada por padrão
             txtRevisao.ReadOnly = true;
@@ -105,6 +140,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             this.Load += async (s, e) =>
             {
                 await CarregarTiposModeloAsync();
+                await AtualizarCardProjetosStatusRAsync();
             };
 
             // =========================
@@ -173,7 +209,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // BUSCAR MODELOS
+        // BUSCAR MODELOS (AGORA: PostGre)
         // =========================
         private async Task BuscarModelosAsync(string texto)
         {
@@ -193,11 +229,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             try
             {
-                using var ctx = new grupometalContext();
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
                 var query =
-                    from m in ctx.Modelo_EF
-                    join e in ctx.Empresa_GM on m.ClienteempresaId equals e.EmpresaId
+                    from m in ctxPg.Modelo
+                    join e in ctxPg.Empresa on m.ClienteempresaId equals e.EmpresaId
                     where m.ClienteempresaId == _empresaIdSelecionada.Value
                     select new ModeloGridRow
                     {
@@ -262,7 +298,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao buscar modelos: " + ex.Message);
+                MessageBox.Show("Erro ao buscar modelos (PostGre): " + ex.Message);
             }
         }
 
@@ -283,7 +319,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // CARREGAR DETALHES DO MODELO + HEADER + RTF + IMAGEM
+        // CARREGAR DETALHES DO MODELO + HEADER + RTF + IMAGEM (AGORA: PostGre)
         // =========================
         private async Task CarregarDetalhesAsync(int modeloId)
         {
@@ -293,14 +329,14 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             try
             {
-                using var ctx = new grupometalContext();
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
                 // ✅ evita "estado fantasma" de outro modelo
                 _temProjetoAtual = false;
                 _revUltimoProjeto = 0;
 
                 // 1) Detalhes do modelo
-                var m = await ctx.Modelo_EF
+                var m = await ctxPg.Modelo
                     .AsNoTracking()
                     .Where(x => x.ModeloId == modeloId)
                     .Select(x => new
@@ -348,7 +384,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 txtObservacao.Text = m.Observacao ?? "";
 
-                // Aqui mantém seus TextBoxes do cadastro (modelo)
+                // Pesos do modelo
                 txtPesoBrutoEst.Text = m.Pesomedio?.ToString() ?? "";
                 txtPesoBrutoReal.Text = m.Pesobruto?.ToString() ?? "";
                 txtPesoLiquidoEst.Text = m.Pesoprevisto?.ToString() ?? "";
@@ -358,7 +394,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 string nomeCliente = "";
                 if (_empresaIdSelecionada != null)
                 {
-                    nomeCliente = await ctx.Empresa_GM
+                    nomeCliente = await ctxPg.Empresa
                         .AsNoTracking()
                         .Where(e => e.EmpresaId == _empresaIdSelecionada.Value)
                         .Select(e => e.Sigla ?? e.Nome ?? "")
@@ -367,7 +403,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 if (token.IsCancellationRequested) return;
 
                 // 3) Duas últimas revisões (header 1 e 2)
-                var projetos2 = await ctx.Projeto
+                var projetos2 = await ctxPg.Projeto
                     .AsNoTracking()
                     .Where(p => p.ModeloId == modeloId)
                     .OrderByDescending(p => p.NroRevisao)
@@ -388,7 +424,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 var p2 = projetos2.Count > 1 ? projetos2[1] : null;
 
                 // 4) Último projeto (para RTF atual e flag de projeto existente)
-                var ultProj = await ctx.Projeto
+                var ultProj = await ctxPg.Projeto
                     .AsNoTracking()
                     .Where(p => p.ModeloId == modeloId)
                     .OrderByDescending(p => p.NroRevisao)
@@ -437,13 +473,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     txtRevisao.ReadOnly = true;
                 }
 
-                // 5) Imagem (ProjetoImagem)
+                // 5) Imagem: agora carrega do PostGre (bytea)
                 await CarregarImagemDoModeloViaProjetoImagemAsync(modeloId, token);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao carregar detalhes: " + ex.Message);
+                MessageBox.Show("Erro ao carregar detalhes (PostGre): " + ex.Message);
             }
             finally
             {
@@ -452,7 +488,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // IMAGEM: busca ImagemUrl em ProjetoImagem e baixa do Blob
+        // IMAGEM: busca bytes (bytea) em ProjetoImagem (PostGre) e mostra
         // =========================
         private async Task CarregarImagemDoModeloViaProjetoImagemAsync(int modeloId, CancellationToken token)
         {
@@ -467,69 +503,42 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             {
                 SetImagemLoading();
 
-                using var ctx = new grupometalContext();
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                var imagemUrl = await ctx.ProjetoImagem
+                // prioridade: imagem padrão (1), depois maior revisão
+                var imgRow = await ctxPg.ProjetoImagem
                     .AsNoTracking()
                     .Where(x => x.ModeloId == modeloId)
                     .OrderByDescending(x => x.ImagemPadrao)
                     .ThenByDescending(x => x.NroRevisao)
-                    .Select(x => x.ImagemUrl)
+                    .Select(x => new
+                    {
+                        x.ImagemNome,
+                        x.Imagem
+                    })
                     .FirstOrDefaultAsync(ct);
 
                 if (ct.IsCancellationRequested) return;
 
-                if (string.IsNullOrWhiteSpace(imagemUrl))
+                if (imgRow == null || imgRow.Imagem == null || imgRow.Imagem.Length == 0)
                 {
                     LimparImagem();
                     return;
                 }
 
-                var prefix = $"{_baseUrl}{_containerName}/";
-                var blobName = imagemUrl.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                    ? imagemUrl.Substring(prefix.Length)
-                    : imagemUrl;
+                using var ms = new MemoryStream(imgRow.Imagem);
+                using var temp = Image.FromStream(ms);
+                var bmp = new Bitmap(temp);
 
-                await CarregarImagemBlobAsync(blobName, ct);
+                if (picModelo.InvokeRequired)
+                    picModelo.BeginInvoke(new Action(() => TrocarImagem(bmp)));
+                else
+                    TrocarImagem(bmp);
             }
             catch (OperationCanceledException) { }
             catch
             {
                 LimparImagem();
-            }
-        }
-
-        // =========================
-        // BAIXAR IMAGEM DO BLOB (SAS) -> PictureBox
-        // =========================
-        private async Task CarregarImagemBlobAsync(string blobName, CancellationToken ct)
-        {
-            string containerUrlWithSas = $"{_baseUrl}{_containerName}?{_sasToken}";
-            var containerClient = new BlobContainerClient(new Uri(containerUrlWithSas));
-            var blobClient = containerClient.GetBlobClient(blobName);
-
-            if (!await blobClient.ExistsAsync(ct))
-            {
-                LimparImagem();
-                return;
-            }
-
-            using var ms = new MemoryStream();
-            await blobClient.DownloadToAsync(ms, ct);
-            ms.Position = 0;
-
-            if (ct.IsCancellationRequested) return;
-
-            using var temp = Image.FromStream(ms);
-            var img = new Bitmap(temp);
-
-            if (picModelo.InvokeRequired)
-            {
-                picModelo.BeginInvoke(new Action(() => TrocarImagem(img)));
-            }
-            else
-            {
-                TrocarImagem(img);
             }
         }
 
@@ -735,6 +744,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await SalvarModeloAsync();
         }
 
+        // =========================
+        // SALVAR MODELO (AGORA: PostGre)
+        // =========================
         private async Task SalvarModeloAsync()
         {
             if (_empresaIdSelecionada == null)
@@ -756,15 +768,20 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             try
             {
-                using var ctx = new grupometalContext();
+                // =========================================================
+                // 🚫 MySQL write (COMENTADO)
+                // =========================================================
+                // using var ctx = new grupometalContext();
+                // Modelo_EF entity;
 
-                Modelo_EF entity;
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+                global::Controle_Pedidos.Entities_GM.Modelo_EF entityPg;
 
                 if (_mode == FormMode.Add)
                 {
-                    entity = new Modelo_EF();
-                    entity.ClienteempresaId = _empresaIdSelecionada.Value;
-                    ctx.Modelo_EF.Add(entity);
+                    entityPg = new global::Controle_Pedidos.Entities_GM.Modelo_EF();
+                    entityPg.ClienteempresaId = _empresaIdSelecionada.Value;
+                    ctxPg.Modelo.Add(entityPg);
                 }
                 else
                 {
@@ -774,57 +791,44 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                         return;
                     }
 
-                    entity = await ctx.Modelo_EF
+                    entityPg = await ctxPg.Modelo
                         .FirstOrDefaultAsync(x => x.ModeloId == _modeloIdEmEdicao.Value);
 
-                    if (entity == null)
+                    if (entityPg == null)
                     {
-                        MessageBox.Show("Modelo não encontrado (pode ter sido removido).");
+                        MessageBox.Show("Modelo não encontrado (PostGre).");
                         await CancelarEdicaoAsync();
                         return;
                     }
                 }
 
                 // ========= UI -> Entity =========
-                entity.Numeronocliente = (txtNumeroModelo.Text ?? "").Trim();
-                entity.Descricao = (txtDescricao.Text ?? "").Trim();
-                entity.Observacao = (txtObservacao.Text ?? "").Trim();
+                entityPg.Numeronocliente = (txtNumeroModelo.Text ?? "").Trim();
+                entityPg.Descricao = (txtDescricao.Text ?? "").Trim();
+                entityPg.Observacao = (txtObservacao.Text ?? "").Trim();
 
-                entity.Situacao = ParseCharOrDefault(cmbSituacao.Text, 'A');
-                entity.Estado = ParseNullableChar(cmbEstado.Text);
+                entityPg.Situacao = ParseCharOrDefault(cmbSituacao.Text, 'A');
+                entityPg.Estado = ParseNullableChar(cmbEstado.Text);
 
                 if (cmbTipoModelo.SelectedValue is int tipoId)
-                    entity.TipodemodeloId = tipoId;
+                    entityPg.TipodemodeloId = tipoId;
                 else
-                    entity.TipodemodeloId = 0;
+                    entityPg.TipodemodeloId = 0;
 
-                entity.Nrodepartes = ParseIntOrZero(txtNroPartes.Text);
-                entity.Numerodefiguras = (txtQtdFigurasPlaca.Text ?? "").Trim();
-                entity.Numerodecaixasdemachoporfigura = (txtCxMachoFigura.Text ?? "").Trim();
+                entityPg.Nrodepartes = ParseIntOrZero(txtNroPartes.Text);
+                entityPg.Numerodefiguras = (txtQtdFigurasPlaca.Text ?? "").Trim();
+                entityPg.Numerodecaixasdemachoporfigura = (txtCxMachoFigura.Text ?? "").Trim();
 
-                entity.Valordomodelo = ParseFloatOrNull(txtValorModelo.Text);
+                entityPg.Valordomodelo = ParseFloatOrNull(txtValorModelo.Text);
 
-                // Pesos do MODELO (estimados/reais)
-                entity.Pesomedio = ParseFloatOrNull(txtPesoBrutoEst.Text);
-                entity.Pesobruto = ParseFloatOrNull(txtPesoBrutoReal.Text);
-                entity.Pesoprevisto = ParseFloatOrNull(txtPesoLiquidoEst.Text);
-                entity.Pesoliquido = ParseFloatOrNull(txtPesoLiquidoReal.Text);
-                // =================================
+                entityPg.Pesomedio = ParseFloatOrNull(txtPesoBrutoEst.Text);
+                entityPg.Pesobruto = ParseFloatOrNull(txtPesoBrutoReal.Text);
+                entityPg.Pesoprevisto = ParseFloatOrNull(txtPesoLiquidoEst.Text);
+                entityPg.Pesoliquido = ParseFloatOrNull(txtPesoLiquidoReal.Text);
 
-                // ✅ salva no MySQL
-                await ctx.SaveChangesAsync();
+                await ctxPg.SaveChangesAsync();
 
-                int savedId = entity.ModeloId;
-
-                // ✅ replica no PostGre (upsert)
-                try
-                {
-                    await ReplicarModeloParaPostgreAsync(entity);
-                }
-                catch (Exception exPg)
-                {
-                    MessageBox.Show("⚠ Modelo salvo no MySQL, mas falhou ao replicar no PostGre:\n\n" + exPg.GetBaseException().Message);
-                }
+                int savedId = entityPg.ModeloId;
 
                 _mode = FormMode.View;
                 _modeloIdEmEdicao = null;
@@ -833,16 +837,29 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 dgvModelos.Enabled = true;
                 AtualizarUIEstado();
 
+                // recarrega lista no PG e seleciona
                 await BuscarModelosAsync(txtFiltroModelo.Text);
                 SelecionarModeloNoGrid(savedId);
-
                 await CarregarDetalhesAsync(savedId);
 
-                MessageBox.Show("Modelo salvo com sucesso!");
+                MessageBox.Show("Modelo salvo com sucesso (PostGre)!");
+            }
+            catch (DbUpdateException dbEx)
+            {
+                var root = dbEx.GetBaseException();
+                MessageBox.Show(
+                    "Erro ao salvar modelo (PostGre):\n\n" +
+                    root.Message +
+                    "\n\nDetalhes:\n" +
+                    (dbEx.InnerException?.Message ?? "(sem inner)"),
+                    "Erro PostGre",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao salvar modelo: " + ex.Message);
+                MessageBox.Show("Erro ao salvar modelo (PostGre): " + ex.GetBaseException().Message);
             }
         }
 
@@ -851,6 +868,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await RemoverModeloSelecionadoAsync();
         }
 
+        // =========================
+        // REMOVER MODELO (AGORA: PostGre) + MySQL comentado
+        // =========================
         private async Task RemoverModeloSelecionadoAsync()
         {
             if (_mode != FormMode.View)
@@ -886,13 +906,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             try
             {
-                using var ctx = new grupometalContext();
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                bool temProjeto = await ctx.Projeto
+                bool temProjeto = await ctxPg.Projeto
                     .AsNoTracking()
                     .AnyAsync(p => p.ModeloId == modeloId);
 
-                bool temImagem = await ctx.ProjetoImagem
+                bool temImagem = await ctxPg.ProjetoImagem
                     .AsNoTracking()
                     .AnyAsync(i => i.ModeloId == modeloId);
 
@@ -910,64 +930,40 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     return;
                 }
 
-                var entity = await ctx.Modelo_EF
+                var entity = await ctxPg.Modelo
                     .FirstOrDefaultAsync(m => m.ModeloId == modeloId);
 
                 if (entity == null)
                 {
-                    MessageBox.Show("Modelo não encontrado (pode ter sido removido por outro usuário).");
+                    MessageBox.Show("Modelo não encontrado (PostGre).");
                     await BuscarModelosAsync(txtFiltroModelo.Text);
                     return;
                 }
 
-                // ✅ remove no MySQL
-                ctx.Modelo_EF.Remove(entity);
-                await ctx.SaveChangesAsync();
+                // ✅ remove no PostGre
+                ctxPg.Modelo.Remove(entity);
+                await ctxPg.SaveChangesAsync();
 
-                // ✅ tenta remover também no PostGre
-                try
-                {
-                    using var ctxPg = new gmetalContext();
-
-                    bool temProjetoPg = await ctxPg.Projeto.AsNoTracking().AnyAsync(p => p.ModeloId == modeloId);
-                    bool temImagemPg = await ctxPg.ProjetoImagem.AsNoTracking().AnyAsync(i => i.ModeloId == modeloId);
-
-                    if (temProjetoPg || temImagemPg)
-                    {
-                        MessageBox.Show(
-                            "⚠ Modelo removido no MySQL, mas NÃO foi removido no PostGre porque existem registros relacionados.\n\n" +
-                            $"Projetos (PostGre): {(temProjetoPg ? "SIM" : "NÃO")}\n" +
-                            $"Imagens (PostGre): {(temImagemPg ? "SIM" : "NÃO")}\n",
-                            "Remoção parcial",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Warning
-                        );
-                    }
-                    else
-                    {
-                        var pg = await ctxPg.Modelo.FirstOrDefaultAsync(m => m.ModeloId == modeloId);
-                        if (pg != null)
-                        {
-                            ctxPg.Modelo.Remove(pg);
-                            await ctxPg.SaveChangesAsync();
-                        }
-                    }
-                }
-                catch (Exception exPg)
-                {
-                    MessageBox.Show(
-                        "⚠ Modelo removido no MySQL, mas falhou ao remover no PostGre:\n\n" + exPg.GetBaseException().Message,
-                        "Remoção parcial",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning
-                    );
-                }
+                // =========================================================
+                // 🚫 MySQL delete (COMENTADO)
+                // =========================================================
+                // try
+                // {
+                //     using var ctxMy = new grupometalContext();
+                //     var my = await ctxMy.Modelo_EF.FirstOrDefaultAsync(m => m.ModeloId == modeloId);
+                //     if (my != null)
+                //     {
+                //         ctxMy.Modelo_EF.Remove(my);
+                //         await ctxMy.SaveChangesAsync();
+                //     }
+                // }
+                // catch { /* ignorado */ }
 
                 await BuscarModelosAsync(txtFiltroModelo.Text);
 
                 if (dgvModelos.Rows.Count == 0) LimparDetalhes();
 
-                MessageBox.Show("Modelo removido com sucesso!");
+                MessageBox.Show("Modelo removido com sucesso (PostGre)!");
             }
             catch (DbUpdateException dbEx)
             {
@@ -981,7 +977,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao remover: " + ex.Message);
+                MessageBox.Show("Erro ao remover (PostGre): " + ex.Message);
             }
         }
 
@@ -1008,27 +1004,21 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             cmbSituacao.Enabled = editavelModelo;
             cmbEstado.Enabled = editavelModelo;
 
-            // =========================
             // HEADER DO PROJETO: editável SOMENTE durante _edicaoProjetoAtiva
-            // =========================
             bool editProjeto = _edicaoProjetoAtiva;
 
-            // sempre leitura (vem do sistema)
             txtClienteHeader.ReadOnly = true;
             txtDescricaoHeader.ReadOnly = true;
             txtModeloHeader.ReadOnly = true;
 
-            // defaults do sistema
             txtRevHeader.ReadOnly = true;
             txtDataHeader.ReadOnly = true;
             txtAprovHeader.ReadOnly = true;
 
-            // usuário edita durante criação
             txtPBHeader.ReadOnly = !editProjeto;
             txtPLHeader.ReadOnly = !editProjeto;
             txtRendimentoHeader.ReadOnly = !editProjeto;
 
-            // segunda linha do header (histórico)
             txtRevHeader2.ReadOnly = true;
             txtElabHeader.ReadOnly = true;
             txtElabHeader2.ReadOnly = true;
@@ -1058,15 +1048,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             btnNovoProjeto.Visible = temCliente;
             btnNovaRevisao.Visible = temCliente;
 
-            // regras:
-            // - Novo Projeto só se NÃO tem projeto atual
-            // - Nova Revisão só se TEM projeto atual
             btnNovoProjeto.Enabled = temCliente && temModeloSelecionado && isView && !_edicaoProjetoAtiva && !_temProjetoAtual;
             btnNovaRevisao.Enabled = temCliente && temModeloSelecionado && isView && !_edicaoProjetoAtiva && _temProjetoAtual;
 
             btnSalvarProjeto.Enabled = _edicaoProjetoAtiva;
 
-            // trava grid enquanto criando projeto/revisão
             dgvModelos.Enabled = !_edicaoProjetoAtiva && _mode == FormMode.View;
         }
 
@@ -1096,8 +1082,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         // =========================
         // NOVO PROJETO / NOVA REVISÃO (RTF)
         // =========================
-
-        // Novo Projeto: só se NÃO existir projeto no modelo (Rev = 1) e RTF em branco
         private async void btnNovoProjeto_Click(object sender, EventArgs e)
         {
             if (_empresaIdSelecionada == null) return;
@@ -1115,16 +1099,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // ✅ Header automático pelo MODELO
             var header = await GetHeaderPesosDoModeloAsync(row.ModeloId);
 
             _edicaoEhRevisao = false;
 
-            // ✅ Novo Projeto mantém FILEDIALOG e arquivo (como era)
             await IniciarEdicaoProjetoAsync(row, rev: 1, rtfBase: "", pb: header.pbText, pl: header.plText, rend: header.rendText);
         }
 
-        // Nova Revisão: agora pega IMAGEM DO CLIPBOARD e RTF COPIADO da última revisão
         private async void btnNovaRevisao_Click(object sender, EventArgs e)
         {
             if (_empresaIdSelecionada == null) return;
@@ -1136,7 +1117,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // pega dados da última revisão (inclui RTF)
             var info = await GetUltimoProjetoInfoAsync(row.ModeloId);
             if (!info.ok)
             {
@@ -1146,7 +1126,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             int novaRev = info.lastRev + 1;
 
-            // ✅ captura imagem do Clipboard
             var (okClip, clipImg) = TryGetClipboardImage();
             if (!okClip || clipImg == null)
             {
@@ -1160,18 +1139,14 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // ✅ guarda bytes + nome (clipboard)
             _imagemBytes = ImageToPngBytes(clipImg);
             _imagemExt = ".png";
             _imagemNome = $"clipboard_rev_{novaRev}.png";
 
-            // ✅ não usar arquivo nesta revisão
             _imagemLocalPath = null;
 
-            // mostra imagem no preview
             TrocarImagem(new Bitmap(clipImg));
 
-            // ✅ Header automático pelo MODELO (Real > Estimado)
             var header = await GetHeaderPesosDoModeloAsync(row.ModeloId);
 
             _edicaoEhRevisao = true;
@@ -1179,14 +1154,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await IniciarEdicaoProjetoAsync_SemFileDialog(
                 row,
                 rev: novaRev,
-                rtfBase: info.lastRtf,     // ✅ COPIA RTF ANTERIOR
+                rtfBase: info.lastRtf,
                 pb: header.pbText,
                 pl: header.plText,
                 rend: header.rendText
             );
         }
 
-        // Método original (Novo Projeto): abre file picker
         private async Task IniciarEdicaoProjetoAsync(
             ModeloGridRow row,
             int rev,
@@ -1199,11 +1173,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             _revProjetoAtual = rev;
             _projetoIdAtual = null;
 
-            // ✅ Novo Projeto é por arquivo: zera clipboard para não misturar
             _imagemBytes = null;
             _imagemNome = null;
 
-            // selecionar imagem
             using var ofd = new OpenFileDialog();
             ofd.Title = _edicaoEhRevisao ? "Selecione a imagem da NOVA REVISÃO" : "Selecione a imagem do NOVO PROJETO";
             ofd.Filter = "Imagens|*.jpg;*.jpeg;*.png;*.bmp;*.webp";
@@ -1214,7 +1186,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             _imagemLocalPath = ofd.FileName;
             _imagemExt = Path.GetExtension(_imagemLocalPath);
 
-            // mostra imagem
             try
             {
                 using var fs = new FileStream(_imagemLocalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -1228,13 +1199,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // entra em modo edição de projeto/revisão
             _edicaoProjetoAtiva = true;
 
-            // aplica readOnly/enable conforme flag
             SetCamposEditaveis(false);
 
-            // cabeçalho (defaults)
             txtModeloHeader.Text = row.Numeronocliente ?? "";
             txtDescricaoHeader.Text = (txtDescricao.Text ?? "").Trim();
 
@@ -1242,12 +1210,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             txtDataHeader.Text = DateTime.Today.ToString("dd/MM/yyyy");
             txtAprovHeader.Text = "SMR";
 
-            // defaults editáveis (agora vêm AUTOMÁTICOS do modelo)
             txtPBHeader.Text = pb ?? "";
             txtPLHeader.Text = pl ?? "";
             txtRendimentoHeader.Text = rend ?? "";
 
-            // ✅ RTF: novo projeto -> em branco; revisão -> copia anterior
             SetRichTextSafe(txtRevisao, rtfBase ?? "");
             txtRevisao.ReadOnly = false;
             txtRevisao.Focus();
@@ -1256,7 +1222,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await Task.CompletedTask;
         }
 
-        // Método novo (Nova Revisão): sem file dialog, usa imagem já carregada do Clipboard
         private async Task IniciarEdicaoProjetoAsync_SemFileDialog(
             ModeloGridRow row,
             int rev,
@@ -1275,13 +1240,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // entra em modo edição de projeto/revisão
             _edicaoProjetoAtiva = true;
 
-            // aplica readOnly/enable conforme flag
             SetCamposEditaveis(false);
 
-            // cabeçalho (defaults)
             txtModeloHeader.Text = row.Numeronocliente ?? "";
             txtDescricaoHeader.Text = (txtDescricao.Text ?? "").Trim();
 
@@ -1289,12 +1251,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             txtDataHeader.Text = DateTime.Today.ToString("dd/MM/yyyy");
             txtAprovHeader.Text = "SMR";
 
-            // defaults editáveis
             txtPBHeader.Text = pb ?? "";
             txtPLHeader.Text = pl ?? "";
             txtRendimentoHeader.Text = rend ?? "";
 
-            // ✅ RTF: revisão -> copia anterior
             SetRichTextSafe(txtRevisao, rtfBase ?? "");
             txtRevisao.ReadOnly = false;
             txtRevisao.Focus();
@@ -1308,11 +1268,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await SalvarProjetoOuRevisaoAsync();
         }
 
-        // ✅ Salva sempre como NOVA LINHA em Projeto e NOVA LINHA em ProjetoImagem
-        // ✅ Replica no PostGre (gmetalContext) em projeto, projeto_imagem
-        //     - PostGre.projeto_imagem.imagem = byte[]
-        //     - MySQL.projeto_imagem.imagem = NULL
-        //     - Não envia imagemurl para o PostGre
+        // =========================
+        // SALVAR PROJETO/REVISÃO (AGORA: PostGre) + EMAIL
+        // =========================
         private async Task SalvarProjetoOuRevisaoAsync()
         {
             if (!_edicaoProjetoAtiva) return;
@@ -1335,10 +1293,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             try
             {
-                using var ctx = new grupometalContext();
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                // pega razão social e sigla (NOT NULL no projeto)
-                var clienteInfo = await ctx.Empresa_GM
+                var clienteInfo = await ctxPg.Empresa
                     .AsNoTracking()
                     .Where(e => e.EmpresaId == _empresaIdSelecionada.Value)
                     .Select(e => new
@@ -1354,13 +1311,17 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 if (string.IsNullOrWhiteSpace(razao)) razao = "SEM RAZAO SOCIAL";
                 if (string.IsNullOrWhiteSpace(sigla)) sigla = "SEM SIGLA";
 
-                // ✅ cria nova linha em Projeto (MySQL)
-                var projeto = new Projeto
+                // bytes da imagem (para gravar no PostGre)
+                byte[] bytesImagem = temClipboard
+                    ? _imagemBytes!
+                    : await File.ReadAllBytesAsync(_imagemLocalPath!);
+
+                // ✅ cria nova linha em Projeto (PostGre)
+                var projeto = new global::Controle_Pedidos.Entities_GM.Projeto
                 {
                     ModeloId = _modeloIdProjeto.Value,
                     NroRevisao = _revProjetoAtual,
 
-                    // ===== NOVOS CAMPOS =====
                     ColaboradorAprovadorId = "1",
                     Descricao = (txtDescricaoHeader.Text ?? "").Trim(),
                     Elaborador = "projeto",
@@ -1368,51 +1329,67 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     EmpresaId = _empresaIdSelecionada.Value,
                     Responsavel = "SMR",
 
-                    // ===== JÁ EXISTIA (AGORA GARANTINDO LIMPO) =====
                     PesoBruto = StripSuffixER(txtPBHeader.Text),
                     PesoLiquido = StripSuffixER(txtPLHeader.Text),
                     Rendimento = StripSuffixER(txtRendimentoHeader.Text),
 
-                    DataCriacao = DateTime.Today,
+                    Status = _edicaoEhRevisao ? 'V' : 'P',
+
+                    DataCriacao = EnsureUtc(DateTime.Today),
                     ColaboradorAprovadorSigla = "SMR",
 
                     Razaosocial = razao,
                     Sigla = sigla,
 
-                    DadosTecnicos = txtRevisao?.Rtf ?? "" // ✅ RTF
+                    DadosTecnicos = txtRevisao?.Rtf ?? ""
                 };
 
-                ctx.Projeto.Add(projeto);
-                await ctx.SaveChangesAsync();
+                ctxPg.Projeto.Add(projeto);
+                await ctxPg.SaveChangesAsync();
+                // ✅ Se esta revisão foi criada a partir de um projeto reprovado (R),
+                // então muda o status do projeto antigo para HR.
+                if (_edicaoEhRevisao && _projetoIdReprovadoAberto.HasValue)
+                {
+                    var projReprovado = await ctxPg.Projeto
+                        .FirstOrDefaultAsync(p => p.ProjetoId == _projetoIdReprovadoAberto.Value);
+
+                    if (projReprovado != null)
+                    {
+                        // Status pode ser char OU string dependendo do seu EF.
+                        // Vamos setar de forma segura:
+                        var prop = projReprovado.GetType().GetProperty("Status");
+                        if (prop != null)
+                        {
+                            if (prop.PropertyType == typeof(char) || prop.PropertyType == typeof(char?))
+                            {
+                                // Se Status for char, não existe "HR". Use 'H' (hidden/handled).
+                                // (Se você realmente precisa "HR", seu Status tem que ser string no banco/EF)
+                                prop.SetValue(projReprovado, 'H');
+                            }
+                            else if (prop.PropertyType == typeof(string))
+                            {
+                                prop.SetValue(projReprovado, "HR");
+                            }
+                        }
+
+                        await ctxPg.SaveChangesAsync();
+                    }
+
+                    // ✅ limpa para não afetar o próximo fluxo
+                    _projetoIdReprovadoAberto = null;
+                }
+
+                await AtualizarCardProjetosStatusRAsync();
 
                 _projetoIdAtual = projeto.ProjetoId;
 
-                // ✅ replica PROJETO para PostGre
-                try
-                {
-                    await ReplicarProjetoParaPostgreAsync(projeto);
-                }
-                catch (Exception exPg)
-                {
-                    MessageBox.Show("⚠ Projeto salvo no MySQL, mas falhou ao replicar PROJETO no PostGre:\n\n" + exPg.GetBaseException().Message);
-                }
-
-                // ✅ upload imagem para azure (nome usa projetoId + modeloId + rev)
+                // ✅ upload para Azure (mantido)
                 var ext = string.IsNullOrWhiteSpace(_imagemExt) ? ".png" : _imagemExt!;
                 var blobName = $"{_projetoIdAtual}_{_modeloIdProjeto}_{_revProjetoAtual}{ext}";
+                _ = await UploadImagemProjetoAsync(blobName, bytesImagem);
 
-                string imageUrl;
-                if (temClipboard)
-                {
-                    imageUrl = await UploadImagemProjetoAsync(blobName, _imagemBytes!);
-                }
-                else
-                {
-                    imageUrl = await UploadImagemProjetoAsync(blobName, _imagemLocalPath!);
-                }
-
-                // zera imagem padrão anterior
-                var antigas = await ctx.ProjetoImagem
+                // zera imagem padrão anterior (PostGre)
+                var antigas = await ctxPg.ProjetoImagem
                     .Where(x => x.ModeloId == _modeloIdProjeto.Value && x.ImagemPadrao == 1)
                     .ToListAsync();
 
@@ -1423,65 +1400,58 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     ? _imagemNome!
                     : (temArquivo ? Path.GetFileName(_imagemLocalPath!) : "clipboard.png");
 
-                // ✅ sempre cria nova linha em ProjetoImagem (MySQL)
-                var pi = new ProjetoImagem
+                // ✅ cria o objeto PI PRIMEIRO (corrige CS0841)
+                var pi = new global::Controle_Pedidos.Entities_GM.ProjetoImagem
                 {
                     ModeloId = _modeloIdProjeto.Value,
                     NroRevisao = _revProjetoAtual,
-                    ImagemUrl = imageUrl,
                     ImagemNome = nomeImg,
                     ImagemPadrao = 1,
-
-                    // ✅ requisito: no MySQL fica NULL
-                    Imagem = null
+                    Imagem = bytesImagem
                 };
 
-                ctx.ProjetoImagem.Add(pi);
-                await ctx.SaveChangesAsync();
+                ctxPg.ProjetoImagem.Add(pi);
+                await ctxPg.SaveChangesAsync();
 
-                // ✅ replica PROJETO_IMAGEM para PostGre (byte[]), sem imagemurl
-                try
-                {
-                    byte[] bytesPg = temClipboard
-                        ? _imagemBytes!
-                        : await File.ReadAllBytesAsync(_imagemLocalPath!);
+                // =========================================================
+                // 🚫 MySQL inserts (COMENTADOS)
+                // =========================================================
+                // using var ctxMy = new grupometalContext();
+                // ctxMy.Projeto.Add(...); await ctxMy.SaveChangesAsync();
+                // ctxMy.ProjetoImagem.Add(...); await ctxMy.SaveChangesAsync();
 
-                    await ReplicarProjetoImagemParaPostgreAsync(
-                        modeloId: _modeloIdProjeto.Value,
-                        nroRevisao: _revProjetoAtual,
-                        imagemNome: nomeImg,
-                        imagemPadrao: 1,
-                        imagemBytes: bytesPg
-                    );
-                }
-                catch (Exception exPg)
-                {
-                    MessageBox.Show("⚠ Imagem salva no MySQL, mas falhou ao replicar PROJETO_IMAGEM no PostGre:\n\n" + exPg.GetBaseException().Message);
-                }
+                // ✅ envia email (depois de gravar Projeto + ProjetoImagem com sucesso)
+                await EnviarEmailNotificacaoProjetoAsync(
+                    ehRevisao: _edicaoEhRevisao,
+                    modeloId: _modeloIdProjeto.Value,
+                    projetoId: _projetoIdAtual.Value,
+                    nroRevisao: _revProjetoAtual,
+                    clienteSigla: sigla,
+                    clienteRazao: razao,
+                    numeroModelo: (txtModeloHeader.Text ?? "").Trim(),
+                    descricaoModelo: (txtDescricaoHeader.Text ?? "").Trim()
+                );
 
-                // sai do modo criação
                 _edicaoProjetoAtiva = false;
                 _edicaoEhRevisao = false;
                 txtRevisao.ReadOnly = true;
 
-                // limpa estado de imagem da sessão
                 _imagemLocalPath = null;
                 _imagemBytes = null;
                 _imagemNome = null;
 
-                MessageBox.Show("Projeto/Revisão salvo com sucesso!");
+                MessageBox.Show("Projeto/Revisão salvo com sucesso (PostGre)!");
 
-                // recarrega detalhes do modelo atual
                 await CarregarDetalhesAsync(_modeloIdProjeto.Value);
             }
             catch (DbUpdateException dbEx)
             {
                 var real = dbEx.GetBaseException().Message;
-                MessageBox.Show("Erro ao salvar projeto:\n\n" + real);
+                MessageBox.Show("Erro ao salvar projeto (PostGre):\n\n" + real);
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao salvar projeto: " + ex.Message);
+                MessageBox.Show("Erro ao salvar projeto (PostGre): " + ex.Message);
             }
             finally
             {
@@ -1489,23 +1459,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
-        // Upload por ARQUIVO (Novo Projeto - como era)
-        private async Task<string> UploadImagemProjetoAsync(string blobName, string localPath)
-        {
-            string containerUrlWithSas = $"{_baseUrl}{_containerName}?{_sasToken}";
-            var containerClient = new BlobContainerClient(new Uri(containerUrlWithSas));
-            var blobClient = containerClient.GetBlobClient(blobName);
-
-            using var fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-
-            // ✅ Deixa false se você quer evitar sobrescrita (projetoId não deve repetir).
-            // Se quiser robustez contra duplo clique, mude para true.
-            await blobClient.UploadAsync(fs, overwrite: false);
-
-            return $"{_baseUrl}{_containerName}/{blobName}";
-        }
-
-        // Upload por BYTES (Nova Revisão - Clipboard)
+        // Upload por BYTES (usado para arquivo ou clipboard)
         private async Task<string> UploadImagemProjetoAsync(string blobName, byte[] bytes)
         {
             string containerUrlWithSas = $"{_baseUrl}{_containerName}?{_sasToken}";
@@ -1553,11 +1507,65 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
+        // ✅ EMAIL: Monta assunto + HTML e envia (sem anexo)
+        private async Task EnviarEmailNotificacaoProjetoAsync(
+            bool ehRevisao,
+            int modeloId,
+            int projetoId,
+            int nroRevisao,
+            string clienteSigla,
+            string clienteRazao,
+            string numeroModelo,
+            string descricaoModelo)
+        {
+            try
+            {
+                string assunto = ehRevisao
+                    ? $"[GM] Nova REVISÃO Pendente Aprovacão - Modelo {numeroModelo} (Rev {nroRevisao})"
+                    : $"[GM] Novo PROJETO Pendente Aprovacão - Modelo {numeroModelo} (Rev {nroRevisao})";
+
+                string tipo = ehRevisao ? "UMA NOVA REVISÃO" : "UM NOVO PROJETO";
+
+                // evita quebrar HTML com caracteres especiais
+                string enc(string s) => System.Net.WebUtility.HtmlEncode(s ?? "");
+
+                string msg = $@"
+<div style='font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;'>
+  <h2 style='margin:0 0 10px 0;'>{tipo} SALVO</h2>
+  <p style='margin:0 0 10px 0;'>
+    {tipo.ToLower()} foi salvo no sistema.
+  </p>
+
+  <table style='border-collapse:collapse;'>
+    <tr><td style='padding:4px 10px 4px 0;'><b>ProjetoId:</b></td><td style='padding:4px 0;'>{projetoId}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>ModeloId:</b></td><td style='padding:4px 0;'>{modeloId}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Nº Modelo:</b></td><td style='padding:4px 0;'>{enc(numeroModelo)}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Revisão:</b></td><td style='padding:4px 0;'>{nroRevisao}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Cliente (Sigla):</b></td><td style='padding:4px 0;'>{enc(clienteSigla)}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Cliente (Razão):</b></td><td style='padding:4px 0;'>{enc(clienteRazao)}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Descrição:</b></td><td style='padding:4px 0;'>{enc(descricaoModelo)}</td></tr>
+    <tr><td style='padding:4px 10px 4px 0;'><b>Data:</b></td><td style='padding:4px 0;'>{DateTime.Now:dd/MM/yyyy HH:mm}</td></tr>
+  </table>
+    
+  <p style='margin:14px 0 0 0; color:#666; font-size:12px;'>
+    (Mensagem automática do Controle_Pedidos)
+  </p>
+</div>";
+                var mailer = new Controller_Email();
+                await mailer.SendMail_sem_anexo(_emailNotificacaoDestino, assunto, msg);
+            }
+            catch
+            {
+                // não derruba o salvar se o e-mail falhar
+            }
+        }
+
+        // Último projeto agora lê do PostGre
         private async Task<(bool ok, int lastRev, string lastRtf, string pb, string pl, string rend)> GetUltimoProjetoInfoAsync(int modeloId)
         {
-            using var ctx = new grupometalContext();
+            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-            var ult = await ctx.Projeto
+            var ult = await ctxPg.Projeto
                 .AsNoTracking()
                 .Where(p => p.ModeloId == modeloId)
                 .OrderByDescending(p => p.NroRevisao)
@@ -1584,7 +1592,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // ✅ HEADER AUTO (PB/PL/Rendimento) baseado no MODELO
+        // ✅ HEADER AUTO (PB/PL/Rendimento)
         // =========================
         private (string pbText, string plText, string rendText) BuildHeaderPesos(
             float? pbEst, float? pbReal,
@@ -1622,11 +1630,12 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             txtRendimentoHeader.Text = built.rendText;
         }
 
+        // Header pesos agora lê do PostGre
         private async Task<(string pbText, string plText, string rendText)> GetHeaderPesosDoModeloAsync(int modeloId)
         {
-            using var ctx = new grupometalContext();
+            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-            var w = await ctx.Modelo_EF
+            var w = await ctxPg.Modelo
                 .AsNoTracking()
                 .Where(x => x.ModeloId == modeloId)
                 .Select(x => new
@@ -1644,7 +1653,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             return BuildHeaderPesos(w.PB_Est, w.PB_Real, w.PL_Est, w.PL_Real);
         }
 
-        // Remove sufixo " E" / " R" do fim (e deixa "%" intacto se existir)
         private string StripSuffixER(string? s)
         {
             s = (s ?? "").Trim();
@@ -1662,7 +1670,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // TIPOS DE MODELO (COMBO)
+        // TIPOS DE MODELO (COMBO) - agora do PostGre
         // =========================
         private class TipoModeloComboItem
         {
@@ -1672,9 +1680,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
         private async Task CarregarTiposModeloAsync()
         {
-            using var ctx = new grupometalContext();
+            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-            var tiposRaw = await ctx.TipoModelo
+            var tiposRaw = await ctxPg.Tipodemodelo
                 .AsNoTracking()
                 .Select(t => new
                 {
@@ -1750,102 +1758,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             return s[0];
         }
 
-        // ==========================================================
-        // ✅ REPLICAÇÃO MySQL -> PostGre (gmetalContext)
-        // ==========================================================
-
-        private async Task ReplicarModeloParaPostgreAsync(Modelo_EF mysqlEntity)
-        {
-            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
-
-            var pg = await ctxPg.Modelo.FirstOrDefaultAsync(x => x.ModeloId == mysqlEntity.ModeloId);
-
-            if (pg == null)
-            {
-                pg = new global::Controle_Pedidos.Entities_GM.Modelo_EF
-                {
-                    ModeloId = mysqlEntity.ModeloId
-                };
-                ctxPg.Modelo.Add(pg);
-            }
-
-            pg.ClienteempresaId = mysqlEntity.ClienteempresaId;
-            pg.Numeronocliente = mysqlEntity.Numeronocliente;
-            pg.TipodemodeloId = mysqlEntity.TipodemodeloId;
-            pg.Descricao = mysqlEntity.Descricao;
-            pg.Situacao = mysqlEntity.Situacao;
-            pg.Observacao = mysqlEntity.Observacao;
-
-            pg.Valordomodelo = mysqlEntity.Valordomodelo;
-            pg.Nrodepartes = mysqlEntity.Nrodepartes;
-            pg.Numerodefiguras = mysqlEntity.Numerodefiguras;
-            pg.Numerodecaixasdemachoporfigura = mysqlEntity.Numerodecaixasdemachoporfigura;
-            pg.Estado = mysqlEntity.Estado;
-
-            pg.Pesomedio = mysqlEntity.Pesomedio;
-            pg.Pesobruto = mysqlEntity.Pesobruto;
-            pg.Pesoprevisto = mysqlEntity.Pesoprevisto;
-            pg.Pesoliquido = mysqlEntity.Pesoliquido;
-
-            await ctxPg.SaveChangesAsync();
-        }
-
-        private async Task ReplicarProjetoParaPostgreAsync(Projeto mysqlProjeto)
-        {
-            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
-
-            var pg = new global::Controle_Pedidos.Entities_GM.Projeto
-            {
-                ModeloId = mysqlProjeto.ModeloId,
-                NroRevisao = mysqlProjeto.NroRevisao,
-
-                ColaboradorAprovadorId = mysqlProjeto.ColaboradorAprovadorId,
-                Descricao = mysqlProjeto.Descricao,
-                Elaborador = mysqlProjeto.Elaborador,
-                Numeronocliente = mysqlProjeto.Numeronocliente,
-                EmpresaId = mysqlProjeto.EmpresaId,
-                Responsavel = mysqlProjeto.Responsavel,
-
-                PesoBruto = mysqlProjeto.PesoBruto,
-                PesoLiquido = mysqlProjeto.PesoLiquido,
-                Rendimento = mysqlProjeto.Rendimento,
-
-                DataCriacao = EnsureUtc(mysqlProjeto.DataCriacao),
-                ColaboradorAprovadorSigla = mysqlProjeto.ColaboradorAprovadorSigla,
-
-                Razaosocial = mysqlProjeto.Razaosocial,
-                Sigla = mysqlProjeto.Sigla,
-
-                DadosTecnicos = mysqlProjeto.DadosTecnicos
-            };
-
-            ctxPg.Projeto.Add(pg);
-            await ctxPg.SaveChangesAsync();
-        }
-
-        // ✅ agora usa bytes (serve tanto arquivo quanto clipboard)
-        private async Task ReplicarProjetoImagemParaPostgreAsync(
-            int modeloId,
-            int nroRevisao,
-            string imagemNome,
-            int imagemPadrao,
-            byte[] imagemBytes)
-        {
-            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
-
-            var pg = new global::Controle_Pedidos.Entities_GM.ProjetoImagem
-            {
-                ModeloId = modeloId,
-                NroRevisao = nroRevisao,
-                ImagemNome = imagemNome,
-                ImagemPadrao = imagemPadrao,
-                Imagem = imagemBytes
-            };
-
-            ctxPg.ProjetoImagem.Add(pg);
-            await ctxPg.SaveChangesAsync();
-        }
-
         private static DateTime EnsureUtc(DateTime dt)
         {
             if (dt.Kind == DateTimeKind.Unspecified)
@@ -1883,11 +1795,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             return ms.ToArray();
         }
 
+        // =========================
+        // IMPRIMIR
+        // =========================
         private void btnImprimir_Click(object? sender, EventArgs e)
         {
             try
             {
-                // 1) Diagnóstico rápido de nulls
                 if (txtClienteHeader == null) throw new Exception("txtClienteHeader é NULL (nome no Designer errado?)");
                 if (txtModeloHeader == null) throw new Exception("txtModeloHeader é NULL");
                 if (txtDescricaoHeader == null) throw new Exception("txtDescricaoHeader é NULL");
@@ -1901,10 +1815,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 if (txtRevisao == null) throw new Exception("txtRevisao é NULL (RichTextBox não existe com esse nome?)");
                 if (picModelo == null) throw new Exception("picModelo é NULL (PictureBox não existe com esse nome?)");
 
-                // 2) Imagem temporária (pode falhar se não tiver imagem)
                 var imgPath = CriarImagemTempFileFromPictureBox(picModelo);
 
-                // 3) Parâmetros (todos seguros)
                 var parametros = new Dictionary<string, string>
                 {
                     ["Cliente"] = txtClienteHeader.Text ?? "",
@@ -1930,7 +1842,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     ["ImagemPath"] = string.IsNullOrWhiteSpace(imgPath) ? "" : new Uri(imgPath).AbsoluteUri
                 };
 
-                // 4) Abre relatório
                 using var frm = new FrmImpressaoProjeto(parametros);
                 frm.ShowDialog(this);
             }
@@ -1956,6 +1867,97 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             return file;
         }
 
+        private async Task AtualizarCardProjetosStatusRAsync()
+        {
+            try
+            {
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+
+                _qtdProjetosStatusR = await ctxPg.Projeto
+                    .AsNoTracking()
+                    .CountAsync(p => p.Status == 'R');
+
+                // UI
+                lblProjetosRCount.Text = _qtdProjetosStatusR.ToString();
+
+                bool tem = _qtdProjetosStatusR > 0;
+
+                // ✅ Se 0: some
+                pnlCardProjetosR.Visible = tem;
+
+                if (tem)
+                {
+                    // ✅ Se > 0: aparece vermelho
+                    pnlCardProjetosR.BackColor = Color.Firebrick;
+                    lblProjetosRTitle.ForeColor = Color.White;
+                    lblProjetosRCount.ForeColor = Color.White;
+
+                    pnlCardProjetosR.Enabled = true;
+                    pnlCardProjetosR.Cursor = Cursors.Hand;
+                    lblProjetosRTitle.Cursor = Cursors.Hand;
+                    lblProjetosRCount.Cursor = Cursors.Hand;
+                }
+                else
+                {
+                    pnlCardProjetosR.Enabled = false;
+                    pnlCardProjetosR.Cursor = Cursors.Default;
+                    lblProjetosRTitle.Cursor = Cursors.Default;
+                    lblProjetosRCount.Cursor = Cursors.Default;
+                }
+            }
+            catch
+            {
+                // se falhar, não derruba a tela
+                try
+                {
+                    lblProjetosRCount.Text = "-";
+                    pnlCardProjetosR.Visible = false;
+                }
+                catch { }
+            }
+        }
+
+        internal class ProjetoStatusRRow
+        {
+            public int ProjetoId { get; set; }
+            public int EmpresaId { get; set; }
+            public int ModeloId { get; set; }
+
+            public int NroRevisao { get; set; }
+            public DateTime? DataCriacao { get; set; }
+
+            public string Sigla { get; set; } = "";
+            public string RazaoSocial { get; set; } = "";
+            public string NumeroNoCliente { get; set; } = "";
+            public string Descricao { get; set; } = "";
+        }
+
+        private async Task<List<ProjetoStatusRRow>> ListarProjetosStatusRAsync()
+        {
+            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+
+            var lista = await ctxPg.Projeto
+                .AsNoTracking()
+                .Where(p => p.Status == 'R')
+                .OrderByDescending(p => p.DataCriacao)
+                .Select(p => new ProjetoStatusRRow
+                {
+                    ProjetoId = p.ProjetoId,
+                    EmpresaId = p.EmpresaId,
+                    ModeloId = p.ModeloId,
+                    NroRevisao = p.NroRevisao,
+                    DataCriacao = p.DataCriacao,
+
+                    Sigla = p.Sigla ?? "",
+                    RazaoSocial = p.Razaosocial ?? "",
+                    NumeroNoCliente = p.Numeronocliente ?? "",
+                    Descricao = p.Descricao ?? ""
+                })
+                .ToListAsync();
+
+            return lista;
+        }
+
         // =========================
         // OPCIONAIS (eventos vazios)
         // =========================
@@ -1978,5 +1980,251 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private void button3_Click(object sender, EventArgs e) { }
         private void label23_Click(object sender, EventArgs e) { }
         private void label28_Click(object sender, EventArgs e) { }
+
+        private async void pnlCardProjetosR_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (_edicaoProjetoAtiva)
+                    return; // sem mensagem
+
+                // Atualiza contagem antes de abrir
+                await AtualizarCardProjetosStatusRAsync();
+
+                if (_qtdProjetosStatusR <= 0)
+                    return; // sem mensagem
+
+                var lista = await ListarProjetosStatusRAsync();
+                if (lista == null || lista.Count == 0)
+                    return;
+
+                ProjetoStatusRRow? selecionado = null;
+
+                using (var frm = new FrmProjetosStatusR(lista))
+                {
+                    var dr = frm.ShowDialog(this);
+                    if (dr != DialogResult.OK)
+                        return;
+
+                    selecionado = frm.ProjetoSelecionado;
+
+                }
+
+                if (selecionado == null)
+                    return;
+
+                // ✅ guarda qual projeto "R" o usuário abriu
+                _projetoIdReprovadoAberto = selecionado.ProjetoId;
+
+                // ✅ ESTE É O PULO DO GATO:
+                // dá 1 ciclo pro WinForms processar o fechamento do dialog (WM_CLOSE/repaint)
+                await Task.Yield();
+
+                // ✅ Melhor ainda: joga o carregamento pro próximo ciclo do message loop
+                // assim você garante que o popup "some" antes de carregar o banco/imagem.
+                this.BeginInvoke(new Action(async () =>
+                {
+                    try
+                    {
+                        await CarregarClienteESelecionarModeloAsync(
+                            empresaId: selecionado.EmpresaId,
+                            modeloId: selecionado.ModeloId
+                        );
+
+                        await AtualizarCardProjetosStatusRAsync();
+                    }
+                    catch (Exception ex2)
+                    {
+                        MessageBox.Show("Erro ao carregar projeto selecionado: " + ex2.GetBaseException().Message);
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Erro ao abrir pendências (Status R): " + ex.GetBaseException().Message);
+            }
+        }
+
+        private async Task CarregarClienteESelecionarModeloAsync(int empresaId, int modeloId)
+        {
+            using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+
+            // 1) Busca nome/sigla do cliente
+            var cli = await ctxPg.Empresa
+                .AsNoTracking()
+                .Where(e => e.EmpresaId == empresaId)
+                .Select(e => new
+                {
+                    Nome = (e.Sigla ?? e.Nome ?? "").Trim()
+                })
+                .FirstOrDefaultAsync();
+
+            // 2) Ajusta estado do form (igual seu fluxo de "buscar cliente")
+            _empresaIdSelecionada = empresaId;
+            txtCliente.Text = cli?.Nome ?? "";
+
+            txtFiltroModelo.Text = "";
+
+            _mode = FormMode.View;
+            _modeloIdEmEdicao = null;
+
+            CancelarEdicaoProjetoUI();
+
+            SetCamposEditaveis(false);
+            dgvModelos.Enabled = true;
+
+            // 3) Carrega grid modelos desse cliente
+            await BuscarModelosAsync("");
+
+            // 4) Seleciona o modelo do projeto
+            SelecionarModeloNoGrid(modeloId);
+
+            // 5) Carrega detalhes (modelo + headers + RTF + imagem)
+            await CarregarDetalhesAsync(modeloId);
+        }
+
+        internal class FrmProjetosStatusR : Form
+        {
+            private readonly DataGridView dgv = new DataGridView();
+            private readonly Button btnOk = new Button();
+            private readonly Button btnCancelar = new Button();
+
+            public Cadastro_Modelo.ProjetoStatusRRow? ProjetoSelecionado { get; private set; }
+
+            public FrmProjetosStatusR(List<Cadastro_Modelo.ProjetoStatusRRow> lista)
+            {
+                this.Text = "Projetos em Status R";
+                this.StartPosition = FormStartPosition.CenterParent;
+                this.Width = 1000;
+                this.Height = 520;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.ShowInTaskbar = false;
+
+                // ✅ DataGrid
+                dgv.Dock = DockStyle.Top;
+                dgv.Height = 420;
+                dgv.ReadOnly = true;
+                dgv.AllowUserToAddRows = false;
+                dgv.AllowUserToDeleteRows = false;
+                dgv.AllowUserToResizeRows = false;
+                dgv.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+                dgv.MultiSelect = false;
+                dgv.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+                dgv.RowHeadersVisible = false;
+
+                dgv.DataSource = lista;
+
+                // Headers
+                if (dgv.Columns.Contains("EmpresaId")) dgv.Columns["EmpresaId"].HeaderText = "EmpresaId";
+                if (dgv.Columns.Contains("ModeloId")) dgv.Columns["ModeloId"].HeaderText = "ModeloId";
+                if (dgv.Columns.Contains("ProjetoId")) dgv.Columns["ProjetoId"].HeaderText = "ProjetoId";
+                if (dgv.Columns.Contains("Sigla")) dgv.Columns["Sigla"].HeaderText = "Sigla";
+                if (dgv.Columns.Contains("RazaoSocial")) dgv.Columns["RazaoSocial"].HeaderText = "Cliente";
+                if (dgv.Columns.Contains("NumeroNoCliente")) dgv.Columns["NumeroNoCliente"].HeaderText = "Nº Modelo";
+                if (dgv.Columns.Contains("Descricao")) dgv.Columns["Descricao"].HeaderText = "Descrição";
+                if (dgv.Columns.Contains("NroRevisao")) dgv.Columns["NroRevisao"].HeaderText = "Rev";
+                if (dgv.Columns.Contains("DataCriacao")) dgv.Columns["DataCriacao"].HeaderText = "Data";
+
+                // Botões
+                btnOk.Text = "Selecionar";
+                btnOk.Width = 120;
+                btnOk.Height = 35;
+                btnOk.Left = this.ClientSize.Width - 260;
+                btnOk.Top = 430;
+                btnOk.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
+
+                btnCancelar.Text = "Cancelar";
+                btnCancelar.Width = 120;
+                btnCancelar.Height = 35;
+                btnCancelar.Left = this.ClientSize.Width - 130;
+                btnCancelar.Top = 430;
+                btnCancelar.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
+
+                // ✅ DialogResult nos botões (fluxo estável)
+                btnOk.DialogResult = DialogResult.OK;
+                btnCancelar.DialogResult = DialogResult.Cancel;
+
+                this.AcceptButton = btnOk;
+                this.CancelButton = btnCancelar;
+
+                // ✅ Eventos
+                btnOk.Click += (s, e) => ConfirmarSelecao();
+
+                // 🔥 Duplo clique blindado: usa HitTest + PerformClick (não fecha “no meio” do ciclo do grid)
+                dgv.MouseDoubleClick += dgv_MouseDoubleClick;
+
+                // Enter também seleciona
+                dgv.KeyDown += dgv_KeyDown;
+
+                this.Controls.Add(dgv);
+                this.Controls.Add(btnOk);
+                this.Controls.Add(btnCancelar);
+
+                // Seleciona primeira linha
+                if (dgv.Rows.Count > 0)
+                {
+                    dgv.ClearSelection();
+                    dgv.Rows[0].Selected = true;
+
+                    var cell = dgv.Rows[0].Cells.Cast<DataGridViewCell>().FirstOrDefault();
+                    if (cell != null) dgv.CurrentCell = cell;
+                }
+            }
+
+            private void dgv_MouseDoubleClick(object? sender, MouseEventArgs e)
+            {
+                var hit = dgv.HitTest(e.X, e.Y);
+                if (hit.RowIndex < 0) return;
+
+                dgv.ClearSelection();
+                dgv.Rows[hit.RowIndex].Selected = true;
+
+                if (hit.ColumnIndex >= 0)
+                    dgv.CurrentCell = dgv.Rows[hit.RowIndex].Cells[hit.ColumnIndex];
+
+                // ✅ dispara o OK (fluxo modal correto)
+                btnOk.PerformClick();
+            }
+
+            private void dgv_KeyDown(object? sender, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    btnOk.PerformClick();
+                }
+            }
+
+            private void ConfirmarSelecao()
+            {
+                if (dgv.CurrentRow?.DataBoundItem is Cadastro_Modelo.ProjetoStatusRRow row)
+                {
+                    ProjetoSelecionado = row;
+
+                    // ✅ Some imediatamente (UX)
+                    this.Hide();
+
+                    // ✅ Fecha com segurança no próximo ciclo do UI thread
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        this.DialogResult = DialogResult.OK;
+                        this.Close();
+                        this.Dispose();
+                    }));
+                }
+                else
+                {
+                    // Se quiser, pode até remover esta msg também
+                    MessageBox.Show("Selecione uma linha.");
+                }
+            }
+        }
+
+        private void label30_Click(object sender, EventArgs e) { }
+
+        private void pictureBox2_Click(object sender, EventArgs e) { }
     }
 }
