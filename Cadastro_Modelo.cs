@@ -6,12 +6,12 @@
 //   - Inserts/Updates/Deletes acontecem APENAS no PostGre
 // ✅ EXTRA:
 //   - Ao salvar NOVO PROJETO ou NOVA REVISÃO -> envia e-mail para Joao.rossitti@grupometal.com.br
-//
-// ⚠️ Observações importantes:
-// 1) Eu mantive o Azure Blob para upload (como você já tinha), mas a UI passa a carregar a imagem do PostGre (bytea) por padrão.
-// 2) O popup FrmSelecionarCliente não foi fornecido aqui. Ele continua igual. Idealmente ele também deveria buscar do PostGre.
-// 3) Este arquivo assume que o gmetalContext tem os DbSets: Modelo, Projeto, ProjetoImagem, Empresa_GM, TipoModelo
-//    com campos equivalentes aos usados no seu MySQL. Se algum nome estiver diferente no seu PG, me diga o erro de compile que eu ajusto.
+// ✅ NOVO (Regra Produção/Liga nobre):
+//   - Ao clicar "Novo Projeto" ou "Nova Revisão" -> checa producao_item nas etapas 50/75/100/150/200
+//   - Se não encontrar: libera e salva status D (projeto) / E (revisão)
+//   - Se encontrar: se QUALQUER item tiver liga com Necessita_Aprovacao_FA = TRUE -> trata como nobre
+//       -> status B (projeto) / C (revisão)
+//       -> se TODOS não nobres -> status D (projeto) / E (revisão)
 
 using Azure.Storage.Blobs;
 using Controle_Pedidos;
@@ -76,6 +76,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _modeloIdProjeto = null;
         private int? _projetoIdAtual = null;
         private int _revProjetoAtual = 0;
+
+        // ✅ Status calculado no clique (Novo Projeto / Nova Revisão) de acordo com produção/liga
+        private char _statusProjetoParaSalvar = 'D';
 
         // =========================
         // CONTROLE: Projeto reprovado (Status R) que foi aberto pelo CARD
@@ -944,21 +947,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 ctxPg.Modelo.Remove(entity);
                 await ctxPg.SaveChangesAsync();
 
-                // =========================================================
-                // 🚫 MySQL delete (COMENTADO)
-                // =========================================================
-                // try
-                // {
-                //     using var ctxMy = new grupometalContext();
-                //     var my = await ctxMy.Modelo_EF.FirstOrDefaultAsync(m => m.ModeloId == modeloId);
-                //     if (my != null)
-                //     {
-                //         ctxMy.Modelo_EF.Remove(my);
-                //         await ctxMy.SaveChangesAsync();
-                //     }
-                // }
-                // catch { /* ignorado */ }
-
                 await BuscarModelosAsync(txtFiltroModelo.Text);
 
                 if (dgvModelos.Rows.Count == 0) LimparDetalhes();
@@ -1079,6 +1067,64 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
+        // =========================================================
+        // ✅ NOVO: REGRA Produção/Liga nobre => status do projeto/revisão
+        // =========================================================
+
+        // Etapas "pedido em aberto"
+        private static bool IsEtapaAberta(int? etapaId)
+        {
+            if (!etapaId.HasValue) return false;
+
+            // evita Contains/inferência/Npgsql
+            return etapaId.Value == 50
+                || etapaId.Value == 75
+                || etapaId.Value == 100
+                || etapaId.Value == 150
+                || etapaId.Value == 200;
+        }
+
+        // Retorna o status para salvar, conforme regra:
+        // - Sem pedido (ou sem nobre): Projeto 'D' / Revisão 'E'
+        // - Com nobre (QUALQUER UM):  Projeto 'B' / Revisão 'C'
+        private async Task<char> CalcularStatusPorPedidoELigaAsync(int modeloId, bool ehRevisao)
+        {
+            char statusSemNobre = ehRevisao ? 'E' : 'D';
+            char statusComNobre = ehRevisao ? 'C' : 'B';
+
+            try
+            {
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+
+                // 1) Existe algum pedido aberto nessas etapas?
+                // 2) Se existir, QUALQUER UM tem liga nobre? (Necessita_Aprovacao_FA = TRUE)
+                //    -> se 15 não nobre + 1 nobre => trata como nobre.
+                //
+                // Fazemos um Any() com JOIN direto para ficar 100% server-side.
+                bool temLigaNobre = await (
+                    from pi in ctxPg.ProducaoItem.AsNoTracking()
+                    join l in ctxPg.Liga.AsNoTracking() on pi.LigaId equals l.LigaId
+                    where pi.ModeloId == modeloId
+                          && (pi.EtapaId == 50 || pi.EtapaId == 75 || pi.EtapaId == 100 || pi.EtapaId == 150 || pi.EtapaId == 200)
+                          && l.Necessita_Aprovacao_FA == true
+                    select 1
+                ).AnyAsync();
+
+                if (temLigaNobre)
+                    return statusComNobre;
+
+                // Se não achou liga nobre, ainda pode existir pedido aberto com liga não nobre.
+                // Nesse caso retorna status sem nobre (D/E).
+                // Se nem pedido existir, também D/E.
+                return statusSemNobre;
+            }
+            catch
+            {
+                // Se der qualquer erro, não trava o usuário: considera sem nobre (D/E)
+                return statusSemNobre;
+            }
+        }
+
         // =========================
         // NOVO PROJETO / NOVA REVISÃO (RTF)
         // =========================
@@ -1098,6 +1144,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 MessageBox.Show("Este modelo já possui projeto. Use 'Nova Revisão'.");
                 return;
             }
+
+            // ✅ calcula status ANTES de iniciar (regra produção/liga)
+            _statusProjetoParaSalvar = await CalcularStatusPorPedidoELigaAsync(row.ModeloId, ehRevisao: false);
 
             var header = await GetHeaderPesosDoModeloAsync(row.ModeloId);
 
@@ -1138,6 +1187,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 );
                 return;
             }
+
+            // ✅ calcula status ANTES de iniciar (regra produção/liga)
+            _statusProjetoParaSalvar = await CalcularStatusPorPedidoELigaAsync(row.ModeloId, ehRevisao: true);
 
             _imagemBytes = ImageToPngBytes(clipImg);
             _imagemExt = ".png";
@@ -1333,7 +1385,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     PesoLiquido = StripSuffixER(txtPLHeader.Text),
                     Rendimento = StripSuffixER(txtRendimentoHeader.Text),
 
-                    Status = _edicaoEhRevisao ? 'V' : 'P',
+                    // ✅ AQUI: status conforme regra (B/C/D/E)
+                    Status = _statusProjetoParaSalvar,
 
                     DataCriacao = EnsureUtc(DateTime.Today),
                     ColaboradorAprovadorSigla = "SMR",
@@ -1346,6 +1399,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 ctxPg.Projeto.Add(projeto);
                 await ctxPg.SaveChangesAsync();
+
                 // ✅ Se esta revisão foi criada a partir de um projeto reprovado (R),
                 // então muda o status do projeto antigo para HR.
                 if (_edicaoEhRevisao && _projetoIdReprovadoAberto.HasValue)
@@ -1355,15 +1409,12 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                     if (projReprovado != null)
                     {
-                        // Status pode ser char OU string dependendo do seu EF.
-                        // Vamos setar de forma segura:
                         var prop = projReprovado.GetType().GetProperty("Status");
                         if (prop != null)
                         {
                             if (prop.PropertyType == typeof(char) || prop.PropertyType == typeof(char?))
                             {
-                                // Se Status for char, não existe "HR". Use 'H' (hidden/handled).
-                                // (Se você realmente precisa "HR", seu Status tem que ser string no banco/EF)
+                                // Se Status for char, não existe "HR". Use 'H'.
                                 prop.SetValue(projReprovado, 'H');
                             }
                             else if (prop.PropertyType == typeof(string))
@@ -1375,7 +1426,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                         await ctxPg.SaveChangesAsync();
                     }
 
-                    // ✅ limpa para não afetar o próximo fluxo
                     _projetoIdReprovadoAberto = null;
                 }
 
@@ -1400,7 +1450,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     ? _imagemNome!
                     : (temArquivo ? Path.GetFileName(_imagemLocalPath!) : "clipboard.png");
 
-                // ✅ cria o objeto PI PRIMEIRO (corrige CS0841)
                 var pi = new global::Controle_Pedidos.Entities_GM.ProjetoImagem
                 {
                     ModeloId = _modeloIdProjeto.Value,
@@ -1412,13 +1461,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 ctxPg.ProjetoImagem.Add(pi);
                 await ctxPg.SaveChangesAsync();
-
-                // =========================================================
-                // 🚫 MySQL inserts (COMENTADOS)
-                // =========================================================
-                // using var ctxMy = new grupometalContext();
-                // ctxMy.Projeto.Add(...); await ctxMy.SaveChangesAsync();
-                // ctxMy.ProjetoImagem.Add(...); await ctxMy.SaveChangesAsync();
 
                 // ✅ envia email (depois de gravar Projeto + ProjetoImagem com sucesso)
                 await EnviarEmailNotificacaoProjetoAsync(
@@ -1488,6 +1530,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             _imagemNome = null;
 
             txtRevisao.ReadOnly = true;
+
+            // reseta status default (não interfere em nada)
+            _statusProjetoParaSalvar = 'D';
         }
 
         private void SetRichTextSafe(RichTextBox rtb, string value)
@@ -1526,7 +1571,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 string tipo = ehRevisao ? "UMA NOVA REVISÃO" : "UM NOVO PROJETO";
 
-                // evita quebrar HTML com caracteres especiais
                 string enc(string s) => System.Net.WebUtility.HtmlEncode(s ?? "");
 
                 string msg = $@"
@@ -1907,7 +1951,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
             catch
             {
-                // se falhar, não derruba a tela
                 try
                 {
                     lblProjetosRCount.Text = "-";
@@ -2016,12 +2059,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 // ✅ guarda qual projeto "R" o usuário abriu
                 _projetoIdReprovadoAberto = selecionado.ProjetoId;
 
-                // ✅ ESTE É O PULO DO GATO:
-                // dá 1 ciclo pro WinForms processar o fechamento do dialog (WM_CLOSE/repaint)
                 await Task.Yield();
 
-                // ✅ Melhor ainda: joga o carregamento pro próximo ciclo do message loop
-                // assim você garante que o popup "some" antes de carregar o banco/imagem.
                 this.BeginInvoke(new Action(async () =>
                 {
                     try
@@ -2152,7 +2191,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 // ✅ Eventos
                 btnOk.Click += (s, e) => ConfirmarSelecao();
 
-                // 🔥 Duplo clique blindado: usa HitTest + PerformClick (não fecha “no meio” do ciclo do grid)
+                // 🔥 Duplo clique blindado
                 dgv.MouseDoubleClick += dgv_MouseDoubleClick;
 
                 // Enter também seleciona
@@ -2184,7 +2223,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 if (hit.ColumnIndex >= 0)
                     dgv.CurrentCell = dgv.Rows[hit.RowIndex].Cells[hit.ColumnIndex];
 
-                // ✅ dispara o OK (fluxo modal correto)
                 btnOk.PerformClick();
             }
 
@@ -2204,10 +2242,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 {
                     ProjetoSelecionado = row;
 
-                    // ✅ Some imediatamente (UX)
                     this.Hide();
 
-                    // ✅ Fecha com segurança no próximo ciclo do UI thread
                     this.BeginInvoke(new Action(() =>
                     {
                         this.DialogResult = DialogResult.OK;
@@ -2217,14 +2253,12 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 }
                 else
                 {
-                    // Se quiser, pode até remover esta msg também
                     MessageBox.Show("Selecione uma linha.");
                 }
             }
         }
 
         private void label30_Click(object sender, EventArgs e) { }
-
         private void pictureBox2_Click(object sender, EventArgs e) { }
     }
 }
