@@ -1,30 +1,41 @@
 // Cadastro_Modelo.cs
 // ✅ 100% completo (1 arquivo) baseado no seu código
 // ✅ AGORA:
-//   - Writes no MySQL (grupometalContext) ficam COMENTADOS
-//   - TODA LEITURA (grid + detalhes + projeto + imagem + tipos) vem do PostGre (gmetalContext)
-//   - Inserts/Updates/Deletes acontecem APENAS no PostGre
+// - Writes no MySQL (grupometalContext) ficam COMENTADOS
+// - TODA LEITURA (grid + detalhes + projeto + imagem + tipos) vem do PostGre (gmetalContext)
+// - Inserts/Updates/Deletes acontecem APENAS no PostGre
 // ✅ EXTRA:
-//   - Ao salvar NOVO PROJETO ou NOVA REVISÃO -> envia e-mail para Joao.rossitti@grupometal.com.br
-// ✅ NOVO (Regra Produção/Liga nobre):
-//   - Ao clicar "Novo Projeto" ou "Nova Revisão" -> checa producao_item nas etapas 50/75/100/150/200
-//   - Se não encontrar: libera e salva status D (projeto) / E (revisão)
-//   - Se encontrar: se QUALQUER item tiver liga com Necessita_Aprovacao_FA = TRUE -> trata como nobre
-//       -> status B (projeto) / C (revisão)
-//       -> se TODOS não nobres -> status D (projeto) / E (revisão)
+// - Ao salvar NOVO PROJETO ou NOVA REVISÃO -> envia e-mail para Joao.rossitti@grupometal.com.br
+// ✅ Regra Produção/Liga nobre (pedido aberto):
+// - Novo Projeto: D (sem nobre) / B (com nobre)
+// - Nova Revisão: E (sem nobre) / C (com nobre)
+// ✅ Regra NOVA (RNC aberta + Revisar FA + liga nobre):
+// - Somente para NOVA REVISÃO: se existir RNC aberta no setor "Projeto" com ação "Revisar FA" e a liga da RNC for nobre,
+//   então ao SALVAR a revisão o Status deve ser 'C'.
+// ✅ NOVO (Imagem Magma obrigatória p/ status B ou C):
+// - Se status for B ou C -> AO SALVAR pede imagem Magma (file dialog) e faz upload no Azure images-magma
+// ✅ NOVO (Panel2 - Imagem Magma):
+// - pnlCardMagma fica visível se a última revisão tem link Imagem_Magma; clique abre popup com Zoom (maximizado)
 
+using Azure;
 using Azure.Storage.Blobs;
 using Controle_Pedidos;
 using Controle_Pedidos.Controle_Producao.Entities; // (MySQL) mantido só para compatibilidade do projeto, writes comentados
-using Controle_Pedidos.Entities_GM;                 // (PostGre) agora é a fonte oficial (leitura + escrita)
+using Controle_Pedidos.Entities_GM; // (PostGre) agora é a fonte oficial (leitura + escrita)
+using Controle_Pedidos.Sistema_RNCs;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Reporting.WinForms;
 using System;
 using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -36,12 +47,27 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _empresaIdSelecionada = null;
 
         // =========================
-        // AZURE
+        // SQL SERVER GM (DB Server) - tabela rncs
+        // =========================
+        // ✅ Ajuste para a sua string real (Server/Database/User/Password ou Integrated Security)
+        //    Você estava usando Conexao() como se fosse método. O correto é "new Conexao()"
+        private readonly string _sqlServerGMConnectionString;
+
+        // =========================
+        // AZURE (images-fa)
         // =========================
         private const string _baseUrl = "https://armazenamentoazure.blob.core.windows.net/";
         private const string _containerName = "images-fa";
         private const string _sasToken =
             "sp=racwdl&st=2026-02-10T10:11:30Z&se=2030-01-01T18:26:30Z&spr=https&sv=2024-11-04&sr=c&sig=Z2K2P0XFY5k23tXWJx7W5v9wECugxn2S3Fzne9mAqvg%3D";
+
+        // =========================
+        // AZURE MAGMA (images-magma)
+        // =========================
+        private const string _magmaBaseUrl = "https://armazenamentoazure.blob.core.windows.net/";
+        private const string _magmaContainer = "images-magma";
+        private const string _magmaSas =
+            "sp=racwd&st=2026-02-27T18:27:08Z&se=2030-02-28T02:42:08Z&spr=https&sv=2024-11-04&sr=c&sig=W2YF2W7QWFjFJzPE42PiQ2r5fdrMvnAEzDxm3L8rK7c%3D";
 
         private CancellationTokenSource? _ctsImagem;
 
@@ -57,6 +83,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         // CARD: Projetos Status 'R'
         // =========================
         private int _qtdProjetosStatusR = 0;
+
+        // =========================
+        // CARD: Imagem Magma (pnlCardMagma)
+        // =========================
+        private string? _imagemMagmaUrlAtual = null;
 
         // =========================
         // MODO DA TELA (VIEW/ADD/EDIT)
@@ -77,7 +108,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _projetoIdAtual = null;
         private int _revProjetoAtual = 0;
 
-        // ✅ Status calculado no clique (Novo Projeto / Nova Revisão) de acordo com produção/liga
+        // ✅ Status calculado no clique (Novo Projeto / Nova Revisão) de acordo com produção/liga (+ RNC na revisão)
         private char _statusProjetoParaSalvar = 'D';
 
         // =========================
@@ -86,7 +117,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private int? _projetoIdReprovadoAberto = null;
 
         // ===== ORIGEM IMAGEM =====
-        // Novo Projeto (arquivo) continua igual
+        // Novo Projeto (arquivo)
         private string? _imagemLocalPath = null;
         private string? _imagemExt = null;
 
@@ -107,6 +138,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         {
             InitializeComponent();
 
+            // ✅ aqui é onde deve setar o readonly
+            _sqlServerGMConnectionString = new Conexao().banco_rnc;
+
             // ✅ IMPORTANTÍSSIMO: ENTER não dispara buscar cliente (evita bug no RichText)
             this.AcceptButton = null;
 
@@ -120,6 +154,16 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             pnlCardProjetosR.Click += pnlCardProjetosR_Click;
             lblProjetosRTitle.Click += pnlCardProjetosR_Click;
             lblProjetosRCount.Click += pnlCardProjetosR_Click;
+
+            // ✅ Card Magma (panel2)
+            try
+            {
+                pnlCardMagma.Click += pnlCardMagma_Click;
+                label33.Click += pnlCardMagma_Click; // nome informado por você
+                pnlCardMagma.Visible = false;
+                pnlCardMagma.Enabled = false;
+            }
+            catch { /* se designer ainda não tiver o controle, não quebra */ }
 
             // revisão bloqueada por padrão
             txtRevisao.ReadOnly = true;
@@ -144,6 +188,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             {
                 await CarregarTiposModeloAsync();
                 await AtualizarCardProjetosStatusRAsync();
+                AtualizarCardMagmaUI(); // inicial
             };
 
             // =========================
@@ -205,14 +250,14 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         {
             if (_empresaIdSelecionada == null) return;
             if (_mode != FormMode.View) return;
-            if (_edicaoProjetoAtiva) return; // não busca durante criação de projeto/revisão
+            if (_edicaoProjetoAtiva) return;
 
             _timerBuscaModelo.Stop();
             _timerBuscaModelo.Start();
         }
 
         // =========================
-        // BUSCAR MODELOS (AGORA: PostGre)
+        // BUSCAR MODELOS (PostGre)
         // =========================
         private async Task BuscarModelosAsync(string texto)
         {
@@ -312,7 +357,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         {
             if (_mode != FormMode.View) return;
             if (_isBindingGrid) return;
-            if (_edicaoProjetoAtiva) return; // trava troca durante criação de projeto/revisão
+            if (_edicaoProjetoAtiva) return;
 
             if (dgvModelos.CurrentRow?.DataBoundItem is not ModeloGridRow row)
                 return;
@@ -322,7 +367,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // CARREGAR DETALHES DO MODELO + HEADER + RTF + IMAGEM (AGORA: PostGre)
+        // CARREGAR DETALHES DO MODELO (PostGre)
         // =========================
         private async Task CarregarDetalhesAsync(int modeloId)
         {
@@ -334,11 +379,12 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             {
                 using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                // ✅ evita "estado fantasma" de outro modelo
                 _temProjetoAtual = false;
                 _revUltimoProjeto = 0;
 
-                // 1) Detalhes do modelo
+                _imagemMagmaUrlAtual = null;
+                AtualizarCardMagmaUI();
+
                 var m = await ctxPg.Modelo
                     .AsNoTracking()
                     .Where(x => x.ModeloId == modeloId)
@@ -357,11 +403,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                         x.Numerodecaixasdemachoporfigura,
                         x.Estado,
 
-                        // Estimados / Reais do modelo
-                        x.Pesomedio,     // PB estimado
-                        x.Pesobruto,     // PB real
-                        x.Pesoprevisto,  // PL estimado
-                        x.Pesoliquido    // PL real
+                        x.Pesomedio,   // PB estimado
+                        x.Pesobruto,   // PB real
+                        x.Pesoprevisto,// PL estimado
+                        x.Pesoliquido  // PL real
                     })
                     .FirstOrDefaultAsync(token);
 
@@ -373,7 +418,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     return;
                 }
 
-                // Preenche controles
                 txtNumeroModelo.Text = m.Numeronocliente ?? "";
                 cmbTipoModelo.SelectedValue = m.TipodemodeloId;
                 txtDescricao.Text = m.Descricao ?? "";
@@ -387,13 +431,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 txtObservacao.Text = m.Observacao ?? "";
 
-                // Pesos do modelo
                 txtPesoBrutoEst.Text = m.Pesomedio?.ToString() ?? "";
                 txtPesoBrutoReal.Text = m.Pesobruto?.ToString() ?? "";
                 txtPesoLiquidoEst.Text = m.Pesoprevisto?.ToString() ?? "";
                 txtPesoLiquidoReal.Text = m.Pesoliquido?.ToString() ?? "";
 
-                // 2) Cliente (sigla/nome)
                 string nomeCliente = "";
                 if (_empresaIdSelecionada != null)
                 {
@@ -405,7 +447,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 }
                 if (token.IsCancellationRequested) return;
 
-                // 3) Duas últimas revisões (header 1 e 2)
                 var projetos2 = await ctxPg.Projeto
                     .AsNoTracking()
                     .Where(p => p.ModeloId == modeloId)
@@ -426,13 +467,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 var p1 = projetos2.Count > 0 ? projetos2[0] : null;
                 var p2 = projetos2.Count > 1 ? projetos2[1] : null;
 
-                // 4) Último projeto (para RTF atual e flag de projeto existente)
                 var ultProj = await ctxPg.Projeto
                     .AsNoTracking()
                     .Where(p => p.ModeloId == modeloId)
                     .OrderByDescending(p => p.NroRevisao)
                     .Select(p => new
                     {
+                        p.ProjetoId,
                         p.NroRevisao,
                         p.DadosTecnicos
                     })
@@ -443,12 +484,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 _temProjetoAtual = ultProj != null;
                 _revUltimoProjeto = ultProj?.NroRevisao ?? 0;
 
-                // Header esquerda da imagem
                 txtClienteHeader.Text = nomeCliente;
                 txtDescricaoHeader.Text = m.Descricao ?? "";
                 txtModeloHeader.Text = m.Numeronocliente ?? "";
 
-                // ✅ HEADER AUTOMÁTICO: Real > Estimado, sufixo R/E + rendimento (PL/PB)
                 AplicarHeaderPesosDoModelo(
                     pbEst: m.Pesomedio,
                     pbReal: m.Pesobruto,
@@ -456,7 +495,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     plReal: m.Pesoliquido
                 );
 
-                // Headers de revisões (1 e 2)
                 txtRevHeader.Text = p1?.NroRevisao.ToString() ?? "";
                 txtRevHeader2.Text = p2?.NroRevisao.ToString() ?? "";
 
@@ -469,14 +507,27 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 txtAprovHeader.Text = p1?.ColaboradorAprovadorSigla ?? "";
                 txtAprovHeader2.Text = p2?.ColaboradorAprovadorSigla ?? "";
 
-                // ✅ RTF do "projeto atual" (última revisão), só se NÃO estiver em edição
                 if (!_edicaoProjetoAtiva)
                 {
                     SetRichTextSafe(txtRevisao, ultProj?.DadosTecnicos ?? "");
                     txtRevisao.ReadOnly = true;
                 }
 
-                // 5) Imagem: agora carrega do PostGre (bytea)
+                if (ultProj != null)
+                {
+                    var lastEntity = await ctxPg.Projeto
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(p => p.ProjetoId == ultProj.ProjetoId, token);
+
+                    _imagemMagmaUrlAtual = TryGetProjetoImagemMagma(lastEntity);
+                    AtualizarCardMagmaUI();
+                }
+                else
+                {
+                    _imagemMagmaUrlAtual = null;
+                    AtualizarCardMagmaUI();
+                }
+
                 await CarregarImagemDoModeloViaProjetoImagemAsync(modeloId, token);
             }
             catch (OperationCanceledException) { }
@@ -491,7 +542,49 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // IMAGEM: busca bytes (bytea) em ProjetoImagem (PostGre) e mostra
+        // CARD MAGMA UI
+        // =========================
+        private void AtualizarCardMagmaUI()
+        {
+            try
+            {
+                bool tem = !string.IsNullOrWhiteSpace(_imagemMagmaUrlAtual);
+
+                pnlCardMagma.Visible = tem;
+                pnlCardMagma.Enabled = tem;
+                pnlCardMagma.Cursor = tem ? Cursors.Hand : Cursors.Default;
+
+                label33.Cursor = tem ? Cursors.Hand : Cursors.Default;
+            }
+            catch { }
+        }
+
+        private async void pnlCardMagma_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (_edicaoProjetoAtiva) return;
+
+                if (string.IsNullOrWhiteSpace(_imagemMagmaUrlAtual))
+                    return;
+
+                using var frm = new FrmImagemMagma(
+                    url: _imagemMagmaUrlAtual,
+                    magmaSas: _magmaSas,
+                    parent: this
+                );
+
+                frm.ShowDialog(this);
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Erro ao abrir imagem Magma:\n\n" + ex.GetBaseException().Message);
+            }
+        }
+
+        // =========================
+        // IMAGEM: busca bytes em ProjetoImagem (PostGre)
         // =========================
         private async Task CarregarImagemDoModeloViaProjetoImagemAsync(int modeloId, CancellationToken token)
         {
@@ -508,7 +601,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                // prioridade: imagem padrão (1), depois maior revisão
                 var imgRow = await ctxPg.ProjetoImagem
                     .AsNoTracking()
                     .Where(x => x.ModeloId == modeloId)
@@ -557,9 +649,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             picModelo.Image = nova;
         }
 
-        // =========================
-        // LIMPAR DETALHES
-        // =========================
         private void LimparDetalhes()
         {
             txtNumeroModelo.Text = "";
@@ -601,6 +690,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             _temProjetoAtual = false;
             _revUltimoProjeto = 0;
+
+            _imagemMagmaUrlAtual = null;
+            AtualizarCardMagmaUI();
         }
 
         private void LimparImagem()
@@ -748,7 +840,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // SALVAR MODELO (AGORA: PostGre)
+        // SALVAR MODELO (PostGre)
         // =========================
         private async Task SalvarModeloAsync()
         {
@@ -805,7 +897,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     }
                 }
 
-                // ========= UI -> Entity =========
                 entityPg.Numeronocliente = (txtNumeroModelo.Text ?? "").Trim();
                 entityPg.Descricao = (txtDescricao.Text ?? "").Trim();
                 entityPg.Observacao = (txtObservacao.Text ?? "").Trim();
@@ -840,7 +931,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 dgvModelos.Enabled = true;
                 AtualizarUIEstado();
 
-                // recarrega lista no PG e seleciona
                 await BuscarModelosAsync(txtFiltroModelo.Text);
                 SelecionarModeloNoGrid(savedId);
                 await CarregarDetalhesAsync(savedId);
@@ -871,9 +961,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await RemoverModeloSelecionadoAsync();
         }
 
-        // =========================
-        // REMOVER MODELO (AGORA: PostGre) + MySQL comentado
-        // =========================
         private async Task RemoverModeloSelecionadoAsync()
         {
             if (_mode != FormMode.View)
@@ -943,7 +1030,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     return;
                 }
 
-                // ✅ remove no PostGre
                 ctxPg.Modelo.Remove(entity);
                 await ctxPg.SaveChangesAsync();
 
@@ -974,7 +1060,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         // =========================
         private void SetCamposEditaveis(bool editavelModelo)
         {
-            // TextBox: ReadOnly (cadastro do modelo)
             txtNumeroModelo.ReadOnly = !editavelModelo;
             txtDescricao.ReadOnly = !editavelModelo;
             txtValorModelo.ReadOnly = !editavelModelo;
@@ -992,7 +1077,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             cmbSituacao.Enabled = editavelModelo;
             cmbEstado.Enabled = editavelModelo;
 
-            // HEADER DO PROJETO: editável SOMENTE durante _edicaoProjetoAtiva
             bool editProjeto = _edicaoProjetoAtiva;
 
             txtClienteHeader.ReadOnly = true;
@@ -1019,7 +1103,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             bool isView = _mode == FormMode.View;
             bool isEditOrAdd = _mode == FormMode.Add || _mode == FormMode.Edit;
 
-            // CRUD modelo
             btnAdicionar.Enabled = isView && !_edicaoProjetoAtiva;
             btnEditar.Enabled = isView && dgvModelos.CurrentRow != null && !_edicaoProjetoAtiva;
             btnRemover.Enabled = isView && dgvModelos.CurrentRow != null && !_edicaoProjetoAtiva;
@@ -1029,7 +1112,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             btnSalvar.Visible = isEditOrAdd;
             btnCancelar.Visible = isEditOrAdd;
 
-            // projeto/revisão
             bool temCliente = _empresaIdSelecionada != null;
             bool temModeloSelecionado = dgvModelos.CurrentRow != null;
 
@@ -1068,25 +1150,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================================================
-        // ✅ NOVO: REGRA Produção/Liga nobre => status do projeto/revisão
+        // ✅ REGRA Produção/Liga nobre (pedido aberto) => status
         // =========================================================
-
-        // Etapas "pedido em aberto"
-        private static bool IsEtapaAberta(int? etapaId)
-        {
-            if (!etapaId.HasValue) return false;
-
-            // evita Contains/inferência/Npgsql
-            return etapaId.Value == 50
-                || etapaId.Value == 75
-                || etapaId.Value == 100
-                || etapaId.Value == 150
-                || etapaId.Value == 200;
-        }
-
-        // Retorna o status para salvar, conforme regra:
-        // - Sem pedido (ou sem nobre): Projeto 'D' / Revisão 'E'
-        // - Com nobre (QUALQUER UM):  Projeto 'B' / Revisão 'C'
         private async Task<char> CalcularStatusPorPedidoELigaAsync(int modeloId, bool ehRevisao)
         {
             char statusSemNobre = ehRevisao ? 'E' : 'D';
@@ -1096,11 +1161,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             {
                 using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-                // 1) Existe algum pedido aberto nessas etapas?
-                // 2) Se existir, QUALQUER UM tem liga nobre? (Necessita_Aprovacao_FA = TRUE)
-                //    -> se 15 não nobre + 1 nobre => trata como nobre.
-                //
-                // Fazemos um Any() com JOIN direto para ficar 100% server-side.
                 bool temLigaNobre = await (
                     from pi in ctxPg.ProducaoItem.AsNoTracking()
                     join l in ctxPg.Liga.AsNoTracking() on pi.LigaId equals l.LigaId
@@ -1110,23 +1170,163 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     select 1
                 ).AnyAsync();
 
-                if (temLigaNobre)
-                    return statusComNobre;
-
-                // Se não achou liga nobre, ainda pode existir pedido aberto com liga não nobre.
-                // Nesse caso retorna status sem nobre (D/E).
-                // Se nem pedido existir, também D/E.
-                return statusSemNobre;
+                return temLigaNobre ? statusComNobre : statusSemNobre;
             }
             catch
             {
-                // Se der qualquer erro, não trava o usuário: considera sem nobre (D/E)
                 return statusSemNobre;
             }
         }
 
+        // =========================================================
+        // ✅ NOVO: REGRA RNC aberta (Setor Projeto + Ação "Revisar FA")
+        // =========================================================
+
+        private static string NormalizeAlphaNumUpper(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            s = s.Trim();
+            var chars = s.Where(ch => char.IsLetterOrDigit(ch)).ToArray();
+            return new string(chars).ToUpperInvariant();
+        }
+
+        private static bool IsAcaoRevisarFA(string? descricaoAcao)
+        {
+            var n = NormalizeAlphaNumUpper(descricaoAcao);
+            return n.Contains("REVISARFA");
+        }
+
+        private static bool IsSetorProjeto(string? setor)
+        {
+            var n = NormalizeAlphaNumUpper(setor);
+            return n.Contains("PROJETO");
+        }
+
+        private List<string> ListarNumerosRncAbertasSetorProjeto_RevisarFA()
+        {
+            try
+            {
+                var dados_acao = new Operacao_RNCs();
+                var acoes_aberto = dados_acao.Acoes_Em_Aberto();
+
+                if (acoes_aberto == null || acoes_aberto.Count == 0)
+                    return new List<string>();
+
+                var rncs = acoes_aberto
+                    .Where(a =>
+                        IsSetorProjeto(a.descricao_setor) &&
+                        IsAcaoRevisarFA(a.descricao_acao) &&
+                        !string.IsNullOrWhiteSpace(a.numero_rnc)
+                    )
+                    .Select(a => a.numero_rnc.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                return rncs;
+            }
+            catch
+            {
+                return new List<string>();
+            }
+        }
+
+        private async Task<List<(string rnc, int modeloId, int ligaId)>> BuscarDadosRncsNoSqlServerAsync(List<string> numerosRnc)
+        {
+            var result = new List<(string rnc, int modeloId, int ligaId)>();
+
+            if (numerosRnc == null || numerosRnc.Count == 0)
+                return result;
+
+            var lista = numerosRnc.Take(500).ToList();
+
+            using var conn = new SqlConnection(_sqlServerGMConnectionString);
+            await conn.OpenAsync();
+
+            using var cmd = conn.CreateCommand();
+
+            var paramNames = new List<string>();
+            for (int i = 0; i < lista.Count; i++)
+            {
+                string p = "@r" + i;
+                paramNames.Add(p);
+                cmd.Parameters.AddWithValue(p, lista[i]);
+            }
+
+            // ✅ MUITO IMPORTANTE:
+            // Você estava selecionando "numero_rnc, id_modelo, id_liga"
+            // mas lendo "RNC" / "modelo_id" / "liga_id".
+            // Aqui eu alinho tudo com ALIAS.
+            cmd.CommandText = $@"
+SELECT
+    numero_rnc AS RNC,
+    id_modelo  AS modelo_id,
+    id_liga    AS liga_id
+FROM rncs
+WHERE numero_rnc IN ({string.Join(",", paramNames)})
+";
+
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                string rnc = (rdr["RNC"]?.ToString() ?? "").Trim();
+
+                int modeloId = 0;
+                int ligaId = 0;
+
+                _ = int.TryParse(rdr["modelo_id"]?.ToString(), out modeloId);
+                _ = int.TryParse(rdr["liga_id"]?.ToString(), out ligaId);
+
+                if (!string.IsNullOrWhiteSpace(rnc) && modeloId > 0 && ligaId > 0)
+                    result.Add((rnc, modeloId, ligaId));
+            }
+
+            return result;
+        }
+
+        private async Task<bool> ExisteRncAbertaLigaNobreParaModeloAsync(int modeloId)
+        {
+            try
+            {
+                var numeros = ListarNumerosRncAbertasSetorProjeto_RevisarFA();
+                if (numeros.Count == 0) return false;
+
+                var dadosRncs = await BuscarDadosRncsNoSqlServerAsync(numeros);
+
+                var ligaIds = dadosRncs
+                    .Where(x => x.modeloId == modeloId)
+                    .Select(x => x.ligaId)
+                    .Distinct()
+                    .ToList();
+
+                if (ligaIds.Count == 0) return false;
+
+                using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+
+                bool temLigaNobre = await ctxPg.Liga
+                    .AsNoTracking()
+                    .AnyAsync(l => ligaIds.Contains(l.LigaId) && l.Necessita_Aprovacao_FA == true);
+
+                return temLigaNobre;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // ✅ Revisão: primeiro regra de pedido; se não for 'C', checa RNC e pode virar 'C'
+        private async Task<char> CalcularStatusRevisaoPorPedidoOuRncAsync(int modeloId)
+        {
+            var statusPedido = await CalcularStatusPorPedidoELigaAsync(modeloId, ehRevisao: true);
+            if (statusPedido == 'C')
+                return 'C';
+
+            bool temRncNobre = await ExisteRncAbertaLigaNobreParaModeloAsync(modeloId);
+            return temRncNobre ? 'C' : 'E';
+        }
+
         // =========================
-        // NOVO PROJETO / NOVA REVISÃO (RTF)
+        // NOVO PROJETO / NOVA REVISÃO
         // =========================
         private async void btnNovoProjeto_Click(object sender, EventArgs e)
         {
@@ -1145,9 +1345,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // ✅ calcula status ANTES de iniciar (regra produção/liga)
             _statusProjetoParaSalvar = await CalcularStatusPorPedidoELigaAsync(row.ModeloId, ehRevisao: false);
-
             var header = await GetHeaderPesosDoModeloAsync(row.ModeloId);
 
             _edicaoEhRevisao = false;
@@ -1188,8 +1386,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 return;
             }
 
-            // ✅ calcula status ANTES de iniciar (regra produção/liga)
-            _statusProjetoParaSalvar = await CalcularStatusPorPedidoELigaAsync(row.ModeloId, ehRevisao: true);
+            // ✅ AQUI ENTRA A NOVA REGRA:
+            // Revisão agora calcula status por (Pedido OU RNC)
+            _statusProjetoParaSalvar = await CalcularStatusRevisaoPorPedidoOuRncAsync(row.ModeloId);
 
             _imagemBytes = ImageToPngBytes(clipImg);
             _imagemExt = ".png";
@@ -1321,7 +1520,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // SALVAR PROJETO/REVISÃO (AGORA: PostGre) + EMAIL
+        // SALVAR PROJETO/REVISÃO (PostGre) + EMAIL + MAGMA (status B/C)
         // =========================
         private async Task SalvarProjetoOuRevisaoAsync()
         {
@@ -1346,6 +1545,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             try
             {
                 using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
+                await using var tx = await ctxPg.Database.BeginTransactionAsync();
 
                 var clienteInfo = await ctxPg.Empresa
                     .AsNoTracking()
@@ -1363,12 +1563,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 if (string.IsNullOrWhiteSpace(razao)) razao = "SEM RAZAO SOCIAL";
                 if (string.IsNullOrWhiteSpace(sigla)) sigla = "SEM SIGLA";
 
-                // bytes da imagem (para gravar no PostGre)
                 byte[] bytesImagem = temClipboard
                     ? _imagemBytes!
                     : await File.ReadAllBytesAsync(_imagemLocalPath!);
 
-                // ✅ cria nova linha em Projeto (PostGre)
                 var projeto = new global::Controle_Pedidos.Entities_GM.Projeto
                 {
                     ModeloId = _modeloIdProjeto.Value,
@@ -1385,7 +1583,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     PesoLiquido = StripSuffixER(txtPLHeader.Text),
                     Rendimento = StripSuffixER(txtRendimentoHeader.Text),
 
-                    // ✅ AQUI: status conforme regra (B/C/D/E)
+                    // ✅ status já calculado no clique (Novo Projeto / Nova Revisão)
                     Status = _statusProjetoParaSalvar,
 
                     DataCriacao = EnsureUtc(DateTime.Today),
@@ -1400,8 +1598,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 ctxPg.Projeto.Add(projeto);
                 await ctxPg.SaveChangesAsync();
 
-                // ✅ Se esta revisão foi criada a partir de um projeto reprovado (R),
-                // então muda o status do projeto antigo para HR.
                 if (_edicaoEhRevisao && _projetoIdReprovadoAberto.HasValue)
                 {
                     var projReprovado = await ctxPg.Projeto
@@ -1413,14 +1609,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                         if (prop != null)
                         {
                             if (prop.PropertyType == typeof(char) || prop.PropertyType == typeof(char?))
-                            {
-                                // Se Status for char, não existe "HR". Use 'H'.
                                 prop.SetValue(projReprovado, 'H');
-                            }
                             else if (prop.PropertyType == typeof(string))
-                            {
                                 prop.SetValue(projReprovado, "HR");
-                            }
                         }
 
                         await ctxPg.SaveChangesAsync();
@@ -1433,12 +1624,51 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 _projetoIdAtual = projeto.ProjetoId;
 
-                // ✅ upload para Azure (mantido)
+                bool precisaMagma = (_statusProjetoParaSalvar == 'B' || _statusProjetoParaSalvar == 'C');
+
+                if (precisaMagma)
+                {
+                    var resp = MessageBox.Show(
+                        "Liga nobre identificada (Status B/C).\n\nSelecione a IMAGEM DA SIMULAÇÃO (Magma) para continuar.\n\n" +
+                        "Se cancelar, o projeto NÃO será salvo.",
+                        "Imagem Magma obrigatória",
+                        MessageBoxButtons.OKCancel,
+                        MessageBoxIcon.Warning);
+
+                    if (resp != DialogResult.OK)
+                    {
+                        await tx.RollbackAsync();
+                        MessageBox.Show("Operação cancelada. O projeto NÃO foi salvo.");
+                        return;
+                    }
+
+                    using var ofdMagma = new OpenFileDialog();
+                    ofdMagma.Title = "Selecione a imagem da Simulação (Magma)";
+                    ofdMagma.Filter = "Imagens|*.jpg;*.jpeg;*.png;*.bmp;*.webp";
+
+                    if (ofdMagma.ShowDialog(this) != DialogResult.OK)
+                    {
+                        await tx.RollbackAsync();
+                        MessageBox.Show("Operação cancelada. O projeto NÃO foi salvo.");
+                        return;
+                    }
+
+                    string blobBaseName = $"{_projetoIdAtual}_{_modeloIdProjeto}_{_revProjetoAtual}";
+                    string urlMagma = await UploadImagemMagmaAsync(blobBaseName, ofdMagma.FileName);
+
+                    if (!TrySetProjetoImagemMagma(projeto, urlMagma))
+                        throw new Exception("Não encontrei a propriedade/coluna Imagem_Magma no entity Projeto.");
+
+                    await ctxPg.SaveChangesAsync();
+
+                    _imagemMagmaUrlAtual = urlMagma;
+                    AtualizarCardMagmaUI();
+                }
+
                 var ext = string.IsNullOrWhiteSpace(_imagemExt) ? ".png" : _imagemExt!;
                 var blobName = $"{_projetoIdAtual}_{_modeloIdProjeto}_{_revProjetoAtual}{ext}";
                 _ = await UploadImagemProjetoAsync(blobName, bytesImagem);
 
-                // zera imagem padrão anterior (PostGre)
                 var antigas = await ctxPg.ProjetoImagem
                     .Where(x => x.ModeloId == _modeloIdProjeto.Value && x.ImagemPadrao == 1)
                     .ToListAsync();
@@ -1462,7 +1692,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 ctxPg.ProjetoImagem.Add(pi);
                 await ctxPg.SaveChangesAsync();
 
-                // ✅ envia email (depois de gravar Projeto + ProjetoImagem com sucesso)
                 await EnviarEmailNotificacaoProjetoAsync(
                     ehRevisao: _edicaoEhRevisao,
                     modeloId: _modeloIdProjeto.Value,
@@ -1474,6 +1703,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     descricaoModelo: (txtDescricaoHeader.Text ?? "").Trim()
                 );
 
+                await tx.CommitAsync();
+
                 _edicaoProjetoAtiva = false;
                 _edicaoEhRevisao = false;
                 txtRevisao.ReadOnly = true;
@@ -1483,17 +1714,16 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 _imagemNome = null;
 
                 MessageBox.Show("Projeto/Revisão salvo com sucesso (PostGre)!");
-
                 await CarregarDetalhesAsync(_modeloIdProjeto.Value);
             }
             catch (DbUpdateException dbEx)
             {
                 var real = dbEx.GetBaseException().Message;
-                MessageBox.Show("Erro ao salvar projeto (PostGre):\n\n" + real);
+                MessageBox.Show("Erro ao salvar projeto (PostGre):\n\n" + real + "\n\n" + dbEx.ToString());
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Erro ao salvar projeto (PostGre): " + ex.Message);
+                MessageBox.Show("Erro ao salvar:\n\n" + ex.ToString());
             }
             finally
             {
@@ -1501,7 +1731,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
-        // Upload por BYTES (usado para arquivo ou clipboard)
+        // Upload por BYTES (images-fa)
         private async Task<string> UploadImagemProjetoAsync(string blobName, byte[] bytes)
         {
             string containerUrlWithSas = $"{_baseUrl}{_containerName}?{_sasToken}";
@@ -1512,6 +1742,92 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             await blobClient.UploadAsync(ms, overwrite: false);
 
             return $"{_baseUrl}{_containerName}/{blobName}";
+        }
+
+        // Upload imagem Magma
+        private async Task<string> UploadImagemMagmaAsync(string blobNameSemExt, string filePath)
+        {
+            var containerUrlWithSas = $"{_magmaBaseUrl}{_magmaContainer}?{_magmaSas}";
+            var containerClient = new BlobContainerClient(new Uri(containerUrlWithSas));
+
+            var ext = Path.GetExtension(filePath);
+            if (string.IsNullOrWhiteSpace(ext)) ext = ".png";
+
+            var blobName = $"{blobNameSemExt}{ext}".Replace("\\", "/");
+            var blobClient = containerClient.GetBlobClient(blobName);
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+
+            try
+            {
+                await blobClient.UploadAsync(filePath, overwrite: true, cancellationToken: cts.Token);
+                return $"{_magmaBaseUrl}{_magmaContainer}/{blobName}";
+            }
+            catch (RequestFailedException rf)
+            {
+                throw new Exception($"Falha Azure Magma (HTTP {rf.Status}) - {rf.ErrorCode}\n{rf.Message}", rf);
+            }
+            catch (OperationCanceledException)
+            {
+                throw new Exception("Timeout ao enviar imagem para o Azure (images-magma). Verifique internet/permissões/SAS.");
+            }
+        }
+
+        private bool TrySetProjetoImagemMagma(global::Controle_Pedidos.Entities_GM.Projeto projeto, string url)
+        {
+            try
+            {
+                var t = projeto.GetType();
+
+                var prop =
+                    t.GetProperty("Imagem_Magma") ??
+                    t.GetProperty("ImagemMagma") ??
+                    t.GetProperty("imagem_magma") ??
+                    t.GetProperty("ImagemMagmaUrl");
+
+                if (prop == null) return false;
+
+                if (prop.PropertyType == typeof(string))
+                {
+                    prop.SetValue(projeto, url);
+                    return true;
+                }
+
+                prop.SetValue(projeto, Convert.ChangeType(url, prop.PropertyType));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string? TryGetProjetoImagemMagma(global::Controle_Pedidos.Entities_GM.Projeto? projeto)
+        {
+            try
+            {
+                if (projeto == null) return null;
+
+                var t = projeto.GetType();
+
+                var prop =
+                    t.GetProperty("Imagem_Magma") ??
+                    t.GetProperty("ImagemMagma") ??
+                    t.GetProperty("imagem_magma") ??
+                    t.GetProperty("ImagemMagmaUrl");
+
+                if (prop == null) return null;
+
+                var val = prop.GetValue(projeto);
+                var s = val?.ToString();
+                if (string.IsNullOrWhiteSpace(s)) return null;
+
+                return s.Trim();
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private void CancelarEdicaoProjetoUI()
@@ -1531,7 +1847,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
             txtRevisao.ReadOnly = true;
 
-            // reseta status default (não interfere em nada)
             _statusProjetoParaSalvar = 'D';
         }
 
@@ -1552,7 +1867,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
-        // ✅ EMAIL: Monta assunto + HTML e envia (sem anexo)
+        // ✅ EMAIL
         private async Task EnviarEmailNotificacaoProjetoAsync(
             bool ehRevisao,
             int modeloId,
@@ -1576,9 +1891,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 string msg = $@"
 <div style='font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;'>
   <h2 style='margin:0 0 10px 0;'>{tipo} SALVO</h2>
-  <p style='margin:0 0 10px 0;'>
-    {tipo.ToLower()} foi salvo no sistema.
-  </p>
+  <p style='margin:0 0 10px 0;'>{tipo.ToLower()} foi salvo no sistema.</p>
 
   <table style='border-collapse:collapse;'>
     <tr><td style='padding:4px 10px 4px 0;'><b>ProjetoId:</b></td><td style='padding:4px 0;'>{projetoId}</td></tr>
@@ -1590,11 +1903,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
     <tr><td style='padding:4px 10px 4px 0;'><b>Descrição:</b></td><td style='padding:4px 0;'>{enc(descricaoModelo)}</td></tr>
     <tr><td style='padding:4px 10px 4px 0;'><b>Data:</b></td><td style='padding:4px 0;'>{DateTime.Now:dd/MM/yyyy HH:mm}</td></tr>
   </table>
-    
-  <p style='margin:14px 0 0 0; color:#666; font-size:12px;'>
-    (Mensagem automática do Controle_Pedidos)
-  </p>
+
+  <p style='margin:14px 0 0 0; color:#666; font-size:12px;'>(Mensagem automática do Controle_Pedidos)</p>
 </div>";
+
                 var mailer = new Controller_Email();
                 await mailer.SendMail_sem_anexo(_emailNotificacaoDestino, assunto, msg);
             }
@@ -1604,7 +1916,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
-        // Último projeto agora lê do PostGre
         private async Task<(bool ok, int lastRev, string lastRtf, string pb, string pl, string rend)> GetUltimoProjetoInfoAsync(int modeloId)
         {
             using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
@@ -1636,7 +1947,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // ✅ HEADER AUTO (PB/PL/Rendimento)
+        // HEADER AUTO
         // =========================
         private (string pbText, string plText, string rendText) BuildHeaderPesos(
             float? pbEst, float? pbReal,
@@ -1674,7 +1985,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             txtRendimentoHeader.Text = built.rendText;
         }
 
-        // Header pesos agora lê do PostGre
         private async Task<(string pbText, string plText, string rendText)> GetHeaderPesosDoModeloAsync(int modeloId)
         {
             using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
@@ -1702,8 +2012,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             s = (s ?? "").Trim();
             if (string.IsNullOrWhiteSpace(s)) return "";
 
-            while (s.Contains("  ")) s = s.Replace("  ", " ");
-
             if (s.EndsWith(" E", StringComparison.OrdinalIgnoreCase) ||
                 s.EndsWith(" R", StringComparison.OrdinalIgnoreCase))
             {
@@ -1714,7 +2022,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // TIPOS DE MODELO (COMBO) - agora do PostGre
+        // TIPOS DE MODELO (COMBO)
         // =========================
         private class TipoModeloComboItem
         {
@@ -1814,7 +2122,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // ✅ CLIPBOARD HELPERS
+        // CLIPBOARD HELPERS
         // =========================
         private static (bool ok, Image? img) TryGetClipboardImage()
         {
@@ -1911,6 +2219,9 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             return file;
         }
 
+        // =========================
+        // CARD Projetos R
+        // =========================
         private async Task AtualizarCardProjetosStatusRAsync()
         {
             try
@@ -1921,17 +2232,13 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                     .AsNoTracking()
                     .CountAsync(p => p.Status == 'R');
 
-                // UI
                 lblProjetosRCount.Text = _qtdProjetosStatusR.ToString();
 
                 bool tem = _qtdProjetosStatusR > 0;
-
-                // ✅ Se 0: some
                 pnlCardProjetosR.Visible = tem;
 
                 if (tem)
                 {
-                    // ✅ Se > 0: aparece vermelho
                     pnlCardProjetosR.BackColor = Color.Firebrick;
                     lblProjetosRTitle.ForeColor = Color.White;
                     lblProjetosRCount.ForeColor = Color.White;
@@ -1965,10 +2272,8 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             public int ProjetoId { get; set; }
             public int EmpresaId { get; set; }
             public int ModeloId { get; set; }
-
             public int NroRevisao { get; set; }
             public DateTime? DataCriacao { get; set; }
-
             public string Sigla { get; set; } = "";
             public string RazaoSocial { get; set; } = "";
             public string NumeroNoCliente { get; set; } = "";
@@ -2002,7 +2307,7 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         }
 
         // =========================
-        // OPCIONAIS (eventos vazios)
+        // (Se você já tem esses handlers no Designer, deixa)
         // =========================
         private void txtCliente_TextChanged(object sender, EventArgs e) { }
         private void label1_Click(object sender, EventArgs e) { }
@@ -2023,19 +2328,25 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         private void button3_Click(object sender, EventArgs e) { }
         private void label23_Click(object sender, EventArgs e) { }
         private void label28_Click(object sender, EventArgs e) { }
+        private void label30_Click(object sender, EventArgs e) { }
+        private void pictureBox2_Click(object sender, EventArgs e) { }
+
+        private void label33_Click(object sender, EventArgs e)
+        {
+            pnlCardMagma_Click(sender, e);
+        }
 
         private async void pnlCardProjetosR_Click(object? sender, EventArgs e)
         {
             try
             {
                 if (_edicaoProjetoAtiva)
-                    return; // sem mensagem
+                    return;
 
-                // Atualiza contagem antes de abrir
                 await AtualizarCardProjetosStatusRAsync();
 
                 if (_qtdProjetosStatusR <= 0)
-                    return; // sem mensagem
+                    return;
 
                 var lista = await ListarProjetosStatusRAsync();
                 if (lista == null || lista.Count == 0)
@@ -2050,13 +2361,11 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                         return;
 
                     selecionado = frm.ProjetoSelecionado;
-
                 }
 
                 if (selecionado == null)
                     return;
 
-                // ✅ guarda qual projeto "R" o usuário abriu
                 _projetoIdReprovadoAberto = selecionado.ProjetoId;
 
                 await Task.Yield();
@@ -2088,7 +2397,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
         {
             using var ctxPg = new global::Controle_Pedidos.Entities_GM.gmetalContext();
 
-            // 1) Busca nome/sigla do cliente
             var cli = await ctxPg.Empresa
                 .AsNoTracking()
                 .Where(e => e.EmpresaId == empresaId)
@@ -2098,7 +2406,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 })
                 .FirstOrDefaultAsync();
 
-            // 2) Ajusta estado do form (igual seu fluxo de "buscar cliente")
             _empresaIdSelecionada = empresaId;
             txtCliente.Text = cli?.Nome ?? "";
 
@@ -2112,13 +2419,10 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             SetCamposEditaveis(false);
             dgvModelos.Enabled = true;
 
-            // 3) Carrega grid modelos desse cliente
             await BuscarModelosAsync("");
 
-            // 4) Seleciona o modelo do projeto
             SelecionarModeloNoGrid(modeloId);
 
-            // 5) Carrega detalhes (modelo + headers + RTF + imagem)
             await CarregarDetalhesAsync(modeloId);
         }
 
@@ -2141,7 +2445,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 this.MinimizeBox = false;
                 this.ShowInTaskbar = false;
 
-                // ✅ DataGrid
                 dgv.Dock = DockStyle.Top;
                 dgv.Height = 420;
                 dgv.ReadOnly = true;
@@ -2155,18 +2458,6 @@ namespace Controle_Pedidos_8.Tela_Cadastro
 
                 dgv.DataSource = lista;
 
-                // Headers
-                if (dgv.Columns.Contains("EmpresaId")) dgv.Columns["EmpresaId"].HeaderText = "EmpresaId";
-                if (dgv.Columns.Contains("ModeloId")) dgv.Columns["ModeloId"].HeaderText = "ModeloId";
-                if (dgv.Columns.Contains("ProjetoId")) dgv.Columns["ProjetoId"].HeaderText = "ProjetoId";
-                if (dgv.Columns.Contains("Sigla")) dgv.Columns["Sigla"].HeaderText = "Sigla";
-                if (dgv.Columns.Contains("RazaoSocial")) dgv.Columns["RazaoSocial"].HeaderText = "Cliente";
-                if (dgv.Columns.Contains("NumeroNoCliente")) dgv.Columns["NumeroNoCliente"].HeaderText = "Nº Modelo";
-                if (dgv.Columns.Contains("Descricao")) dgv.Columns["Descricao"].HeaderText = "Descrição";
-                if (dgv.Columns.Contains("NroRevisao")) dgv.Columns["NroRevisao"].HeaderText = "Rev";
-                if (dgv.Columns.Contains("DataCriacao")) dgv.Columns["DataCriacao"].HeaderText = "Data";
-
-                // Botões
                 btnOk.Text = "Selecionar";
                 btnOk.Width = 120;
                 btnOk.Height = 35;
@@ -2181,27 +2472,21 @@ namespace Controle_Pedidos_8.Tela_Cadastro
                 btnCancelar.Top = 430;
                 btnCancelar.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
 
-                // ✅ DialogResult nos botões (fluxo estável)
                 btnOk.DialogResult = DialogResult.OK;
                 btnCancelar.DialogResult = DialogResult.Cancel;
 
                 this.AcceptButton = btnOk;
                 this.CancelButton = btnCancelar;
 
-                // ✅ Eventos
                 btnOk.Click += (s, e) => ConfirmarSelecao();
 
-                // 🔥 Duplo clique blindado
                 dgv.MouseDoubleClick += dgv_MouseDoubleClick;
-
-                // Enter também seleciona
                 dgv.KeyDown += dgv_KeyDown;
 
                 this.Controls.Add(dgv);
                 this.Controls.Add(btnOk);
                 this.Controls.Add(btnCancelar);
 
-                // Seleciona primeira linha
                 if (dgv.Rows.Count > 0)
                 {
                     dgv.ClearSelection();
@@ -2258,7 +2543,105 @@ namespace Controle_Pedidos_8.Tela_Cadastro
             }
         }
 
-        private void label30_Click(object sender, EventArgs e) { }
-        private void pictureBox2_Click(object sender, EventArgs e) { }
+        // =========================================================
+        // ✅ POPUP: EXIBE IMAGEM MAGMA (somente UI)
+        // =========================================================
+        internal class FrmImagemMagma : Form
+        {
+            private readonly PictureBox pic = new PictureBox();
+            private readonly Label lbl = new Label();
+            private readonly Button btnFechar = new Button();
+
+            private readonly string _url;
+            private readonly string _sas;
+
+            public FrmImagemMagma(string url, string magmaSas, IWin32Window parent)
+            {
+                _url = (url ?? "").Trim();
+                _sas = (magmaSas ?? "").Trim().TrimStart('?');
+
+                Text = "Imagem Magma";
+                StartPosition = FormStartPosition.CenterParent;
+                FormBorderStyle = FormBorderStyle.Sizable;
+                MinimizeBox = false;
+                WindowState = FormWindowState.Maximized;
+
+                lbl.Dock = DockStyle.Top;
+                lbl.Height = 34;
+                lbl.TextAlign = ContentAlignment.MiddleLeft;
+                lbl.Padding = new Padding(10, 0, 10, 0);
+                lbl.Text = "Carregando imagem...";
+
+                btnFechar.Text = "Fechar";
+                btnFechar.Width = 120;
+                btnFechar.Height = 34;
+                btnFechar.Top = 0;
+                btnFechar.Left = this.ClientSize.Width - 130;
+                btnFechar.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+                btnFechar.Click += (s, e) => this.Close();
+
+                pic.Dock = DockStyle.Fill;
+                pic.SizeMode = PictureBoxSizeMode.Zoom;
+                pic.BackColor = Color.Black;
+
+                Controls.Add(pic);
+                Controls.Add(btnFechar);
+                Controls.Add(lbl);
+
+                Shown += async (s, e) => await CarregarAsync();
+                FormClosed += (s, e) =>
+                {
+                    if (pic.Image != null)
+                    {
+                        var old = pic.Image;
+                        pic.Image = null;
+                        old.Dispose();
+                    }
+                };
+            }
+
+            private async Task CarregarAsync()
+            {
+                try
+                {
+                    var finalUrl = MontarUrlComSasSeNecessario(_url);
+
+                    using var http = new HttpClient();
+                    http.Timeout = TimeSpan.FromSeconds(20);
+
+                    var bytes = await http.GetByteArrayAsync(finalUrl);
+
+                    using var ms = new MemoryStream(bytes);
+                    using var img = Image.FromStream(ms);
+                    var bmp = new Bitmap(img);
+
+                    if (pic.Image != null)
+                    {
+                        var old = pic.Image;
+                        pic.Image = null;
+                        old.Dispose();
+                    }
+
+                    pic.Image = bmp;
+                    lbl.Text = "OK";
+                }
+                catch (Exception ex)
+                {
+                    lbl.Text = "Falha ao carregar";
+                    MessageBox.Show("Não foi possível carregar a imagem Magma.\n\n" + ex.GetBaseException().Message);
+                }
+            }
+
+            private string MontarUrlComSasSeNecessario(string url)
+            {
+                if (url.Contains("?"))
+                    return url;
+
+                if (!string.IsNullOrWhiteSpace(_sas))
+                    return url + "?" + _sas;
+
+                return url;
+            }
+        }
     }
 }
